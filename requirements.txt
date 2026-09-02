@@ -1,0 +1,9 @@
+pandas
+numpy
+scipy
+statsmodels
+matplotlib
+seaborn
+pyarrow
+clickhouse-connect
+pytest

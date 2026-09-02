@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Xatu ClickHouse credentials
+secrets.json
+
+# Simulation data cache and run output
+data/cache/
+output/
+
+# Local reth/revm source drops
+revm.tar.gz
