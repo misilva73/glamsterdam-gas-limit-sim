@@ -62,7 +62,6 @@ def synthetic_per_step(
     num_runs: int = 4,
     positions: int = 24,
     arrival_mode: str = BOOTSTRAP,
-    drain_from: int | None = None,
     seed: int = 0,
 ) -> pd.DataFrame:
     """A per-step frame shaped exactly like the engine's output."""
@@ -94,21 +93,20 @@ def synthetic_per_step(
 
     base_fee = 8e9 * (1 + 0.01 * position) * scale
     anchor_price = np.full(size, 9e9)
-    is_drain = np.zeros(size, bool) if drain_from is None else position >= drain_from
     # The model's own arithmetic, so the synthetic frame stays internally
     # consistent with what the engine would have recorded.
-    multiplier = np.where(is_drain, np.nan, scale * (base_fee / anchor_price) ** -elasticity)
+    multiplier = scale * (base_fee / anchor_price) ** -elasticity
 
     frame["arrival_mode"] = arrival_mode
-    frame["is_drain_step"] = is_drain
     frame["source_block_number"] = 21_000_000 + position
     frame["window_instance"] = position // window
     frame["position_in_window"] = position % window
     frame["demand_price_signal"] = base_fee
-    frame["cohort_anchor_price"] = np.where(is_drain, np.nan, anchor_price)
+    frame["cohort_anchor_price"] = anchor_price
     frame["realized_demand_multiplier"] = multiplier
     frame["demand_multiplier_clamped"] = False
     frame["base_fee_per_gas"] = base_fee.astype(np.int64)
+    frame["base_fee_clamped"] = False
     frame["gas_limit"] = gas_limit.astype(np.int64)
     frame["gas_used"] = np.maximum(execution_gas_used, state_gas_used).astype(np.int64)
     frame["block_execution_gas_used"] = execution_gas_used.astype(np.int64)
@@ -123,11 +121,9 @@ def synthetic_per_step(
     frame["included_tx_count"] = rng.poisson(150, size)
     frame["sender_gas_used"] = (0.9 * execution_gas_used).astype(np.int64)
     frame["priority_fees_wei"] = (frame["included_tx_count"] * 1e15).astype(np.int64)
-    frame["arrived_tx_count"] = np.where(is_drain, 0, rng.poisson(160 * scale))
-    frame["arrived_execution_gas"] = np.where(is_drain, 0, execution_gas_used * 1.1).astype(
-        np.int64
-    )
-    frame["arrived_state_gas"] = np.where(is_drain, 0, state_gas_used * 1.1).astype(np.int64)
+    frame["arrived_tx_count"] = rng.poisson(160 * scale)
+    frame["arrived_execution_gas"] = (execution_gas_used * 1.1).astype(np.int64)
+    frame["arrived_state_gas"] = (state_gas_used * 1.1).astype(np.int64)
     frame["backlog_tx_count"] = backlog_tx_count + ineligible_tx_count
     frame["backlog_eligible_tx_count"] = backlog_tx_count
     frame["backlog_fee_ineligible_tx_count"] = ineligible_tx_count
@@ -350,9 +346,9 @@ def test_plot_writes_a_png_for_a_single_scenario(plot, tmp_path):
 @pytest.mark.parametrize("plot", PLOT_FUNCTIONS, ids=lambda f: f.__name__)
 def test_plot_writes_a_png_for_the_full_grid(plot, tmp_path):
     grid = dict(elasticities=(0.0, 0.175), levels=(1.0, 2.0), windows=(16, 64), positions=30)
-    bootstrap = synthetic_per_step(drain_from=24, **grid)
+    bootstrap = synthetic_per_step(**grid)
     historical = synthetic_per_step(
-        num_runs=1, arrival_mode=HISTORICAL, drain_from=24, seed=9, **grid
+        num_runs=1, arrival_mode=HISTORICAL, seed=9, **grid
     )
     assert_png(plot(bootstrap, historical, tmp_path / f"{plot.__name__}_grid.png"))
 
@@ -365,9 +361,9 @@ def test_plot_survives_a_missing_historical_reference(plot, tmp_path):
 
 
 def test_plot_simulation_writes_every_figure(tmp_path):
-    bootstrap = synthetic_per_step(levels=(1.0, 2.0), drain_from=20)
+    bootstrap = synthetic_per_step(levels=(1.0, 2.0))
     historical = synthetic_per_step(
-        levels=(1.0, 2.0), num_runs=1, arrival_mode=HISTORICAL, drain_from=20
+        levels=(1.0, 2.0), num_runs=1, arrival_mode=HISTORICAL
     )
     paths = plot_simulation(bootstrap, historical, tmp_path / "figures")
 
@@ -410,8 +406,6 @@ def test_build_config_applies_every_override(tmp_path):
             "120",
             "--arrival-mode",
             "historical",
-            "--drain-blocks",
-            "30",
             "--num-runs",
             "5",
             "--seed",
@@ -444,7 +438,6 @@ def test_build_config_applies_every_override(tmp_path):
     assert cfg.reference_start_block == 21_000_000
     assert cfg.simulation_horizon_blocks == 120
     assert cfg.arrival_mode == "historical"
-    assert cfg.drain_blocks == 30
     assert cfg.num_bootstrap_runs == 5
     assert cfg.random_seed == 99
     assert cfg.starting_base_fee == 7_000_000_000
@@ -491,8 +484,8 @@ def test_build_grid_overrides_the_sweep():
 
 def test_build_grid_defaults_to_the_plan_grid():
     grid = run_simulation.build_grid(parse([]))
-    assert grid.aggregate_elasticities == (0.0, 0.10, 0.175, 0.28)
-    assert grid.demand_levels == (1.0, 1.5, 2.0, 3.0)
+    assert grid.aggregate_elasticities == (0.10, 0.175, 0.28)
+    assert grid.demand_levels == (1.0, 1.5, 2.0)
     assert grid.bootstrap_window_blocks == (16, 32, 64)
     assert grid.include_historical_reference is True
 
@@ -545,8 +538,6 @@ def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
             "40",
             "--num-runs",
             "3",
-            "--drain-blocks",
-            "10",
             "--elasticities",
             "0",
             "0.175",
@@ -565,20 +556,19 @@ def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
     )
 
     assert set(schemas.PER_STEP_COLUMNS) <= set(result.per_step.columns)
-    assert result.per_step["simulation_position"].max() == 40 + 10 - 1
+    assert result.per_step["simulation_position"].max() == 40 - 1
     assert set(result.per_step["arrival_mode"]) == {BOOTSTRAP, HISTORICAL}
     assert result.per_step.groupby("arrival_mode")["run_index"].nunique().to_dict() == {
         BOOTSTRAP: 3,
         HISTORICAL: 1,
     }
-    assert result.per_step["is_drain_step"].sum() == 10 * (3 + 1) * 2
     assert len(result.summary) == 4  # arrival modes x elasticities
 
     written = {path.name for path in result.outputs}
     assert {
         "per_step.csv",
         "per_step.parquet",
-        "excluded_summary.csv",
+        "replay_outcome_summary.csv",
         "scenario_summary.csv",
         "manifest.json",
         "base_fee.png",

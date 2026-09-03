@@ -19,12 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from config import (
-    DEFAULT_RESCUE_MULTIPLIER,
-    LEGACY_TX_TYPES,
-    SimConfig,
-    TxInclusionPolicy,
-)
+from config import LEGACY_TX_TYPES, SimConfig
 from data import cache
 from schemas import (
     TX_GAS_RESULT_COLUMNS,
@@ -67,7 +62,8 @@ _NULLABLE_GAS_FIELDS = ("schedule_intrinsic_gas",)
 _WEI_FIELDS = ("max_fee_per_gas", "max_priority_fee_per_gas")
 _FLAG_FIELDS = ("baseline_success", "schedule_success")
 
-EXCLUSION_REASONS = (
+REPLAY_OUTCOMES = (
+    "simulatable",
     "baseline_only_failure",
     "schedule_gas_rescuable",
     "schedule_halted_regardless",
@@ -403,52 +399,13 @@ def derive_gas_dimensions(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def split_simulatable(
-    frame: pd.DataFrame,
-    policy: TxInclusionPolicy = "all",
-    max_rescue_multiplier: float | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split into rows the simulator places and rows it only reports.
+def replay_outcome(frame: pd.DataFrame) -> pd.Series:
+    """Classify each row by how it fared in the replay.
 
-    Three policies, giving materially different answers:
-
-    `all` (default) simulates every row, failures included. A failed transaction
-    still occupies block space and still pays, so it is real demand. Its gas
-    figures come from whichever replay run the producer recorded -- the rescued run
-    where one succeeded, the original otherwise.
-
-    `gas_rescued` keeps successes plus rows that a larger gas limit would rescue,
-    dropping only transactions that halted for a non-gas reason.
-
-    `successful_only` is the strict rule: `baseline_success == 1 AND
-    schedule_success == 1`. It models senders never adjusting their gas limits,
-    and on live data discards ~90% of all state gas.
-
-    `max_rescue_multiplier` bounds how much extra limit a sender is assumed to
-    grant. Note `min_multiplier_to_succeed` is grid-censored at
-    `RESCUE_SWEEP_CEILING`, so rows sitting there needed *at least* that much.
-    """
-    if policy == "all":
-        usable = pd.Series(True, index=frame.index)
-    else:
-        usable = (frame["baseline_success"] == 1) & (frame["schedule_success"] == 1)
-        if policy == "gas_rescued":
-            usable |= (frame["baseline_success"] == 1) & _is_gas_rescuable(frame)
-    if max_rescue_multiplier is not None:
-        within_budget = (
-            frame["min_multiplier_to_succeed"].fillna(DEFAULT_RESCUE_MULTIPLIER)
-            <= max_rescue_multiplier
-        )
-        usable &= (frame["schedule_success"] == 1) | within_budget
-
-    selected = frame.loc[usable].reset_index(drop=True)
-    excluded = frame.loc[~usable].copy()
-    excluded["exclusion_reason"] = exclusion_reason(excluded)
-    return selected, excluded.reset_index(drop=True)
-
-
-def exclusion_reason(frame: pd.DataFrame) -> pd.Series:
-    """Classify why a row is not simulatable under the strict original-limit filter.
+    Every row is simulated -- this is a description of the trace, not a filter.
+    A failed transaction still occupies block space and still pays, so it is real
+    demand; its gas figures come from whichever replay run the producer recorded,
+    the rescued run where one succeeded and the original otherwise.
 
     A schedule failure splits in two, and the distinction dominates the analysis:
     `schedule_gas_rescuable` rows succeeded once the replay raised the gas limit,
@@ -487,44 +444,31 @@ def _is_gas_rescuable(frame: pd.DataFrame) -> pd.Series:
     return frame["min_multiplier_to_succeed"].notna()
 
 
-def excluded_summary(
-    excluded: pd.DataFrame, simulatable: pd.DataFrame | None = None
-) -> pd.DataFrame:
-    """Counts and gas by exclusion reason.
+def replay_outcome_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    """Counts and gas by replay outcome, over the whole simulated trace.
 
-    `*_share` is of the excluded set. Pass `simulatable` to also get
-    `*_share_of_all`, which is the figure that says how much of the dataset the
-    filter actually removed -- the within-excluded shares always sum to 1 and so
-    cannot answer that on their own.
+    Nothing is filtered out, so `*_share` is of the entire trace: it answers how
+    much of the demand being simulated came from transactions that failed, and in
+    particular how much state gas sits in `schedule_gas_rescuable` rows whose
+    recorded cost is only realisable if senders raise their signed gas limits.
     """
     columns = ["tx_count", "execution_gas", "state_gas", "schedule_gas_used"]
-    if excluded.empty:
+    if frame.empty:
         empty = pd.DataFrame(
             {c: pd.Series(dtype="int64") for c in columns},
-            index=pd.Index([], name="exclusion_reason"),
+            index=pd.Index([], name="replay_outcome"),
         )
         return empty.assign(**{f"{c}_share": pd.Series(dtype="float64") for c in columns})
 
-    reason = (
-        excluded["exclusion_reason"]
-        if "exclusion_reason" in excluded.columns
-        else exclusion_reason(excluded)
-    )
     summary = (
-        excluded.assign(exclusion_reason=reason, tx_count=1)
-        .groupby("exclusion_reason")[columns]
+        frame.assign(replay_outcome=replay_outcome(frame), tx_count=1)
+        .groupby("replay_outcome")[columns]
         .sum()
-        .reindex(EXCLUSION_REASONS, fill_value=0)
+        .reindex(REPLAY_OUTCOMES, fill_value=0)
         .astype("int64")
     )
     shares = summary.div(summary.sum()).fillna(0.0).add_suffix("_share")
-    parts = [summary, shares]
-    if simulatable is not None:
-        kept = simulatable.assign(tx_count=1)[columns].sum()
-        parts.append(
-            summary.div(summary.sum() + kept).fillna(0.0).add_suffix("_share_of_all")
-        )
-    return pd.concat(parts, axis=1)
+    return pd.concat([summary, shares], axis=1)
 
 
 def block_gas_used(selected: pd.DataFrame) -> int:

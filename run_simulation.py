@@ -37,9 +37,8 @@ from config import DEFAULT_CONFIG, SimConfig, SimulationGrid
 from data.fetch_blocks import fetch_block_headers, starting_base_fee
 from data.load_tx_gas_results import (
     derive_gas_dimensions,
-    excluded_summary,
     load_tx_gas_results,
-    split_simulatable,
+    replay_outcome_summary,
 )
 from sim.engine import run_path
 from sim.workload import bootstrap_path, bootstrap_rng, build_cohorts, historical_path
@@ -114,20 +113,6 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument(
         "--cache-dir", type=Path, help="parquet cache for fetched data (default: data/cache)"
     )
-    source.add_argument(
-        "--tx-inclusion-policy",
-        choices=("all", "gas_rescued", "successful_only"),
-        help="which replay rows count as demand. 'all' (default) simulates every "
-        "transaction including failures; 'gas_rescued' drops only those that halted "
-        "for a non-gas reason; 'successful_only' is the original strict rule, which "
-        "discards ~90%% of state gas on live data",
-    )
-    source.add_argument(
-        "--max-rescue-multiplier",
-        type=float,
-        help="cap how much extra gas limit a sender is assumed to grant; rows needing "
-        "more than this are excluded (default: no cap)",
-    )
 
     sim = parser.add_argument_group("simulation")
     sim.add_argument("--horizon", type=int, help="arrival steps (default: trace length)")
@@ -136,12 +121,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(HISTORICAL_MODE, BOOTSTRAP_MODE),
         help="historical replays the trace once, with no bands; "
         "moving_block_bootstrap resamples cohort windows (default)",
-    )
-    sim.add_argument(
-        "--drain-blocks",
-        type=int,
-        help="blocks simulated after arrivals stop, to see whether the backlog "
-        "clears (default: 0)",
     )
     sim.add_argument(
         "--num-runs", type=int, help="bootstrap paths per grid cell (default: 20)"
@@ -159,12 +138,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--glamsterdam-gas-limit",
         type=int,
         help="ceiling the 1/1024 ramp climbs toward (default: 200,000,000)",
-    )
-    sim.add_argument(
-        "--first-glamsterdam-step",
-        type=int,
-        help="step at which the 1/1024 ramp starts; earlier steps hold "
-        "--fusaka-gas-limit (default: 0). Repriced gas always applies",
     )
 
     demand = parser.add_argument_group("demand model")
@@ -198,8 +171,10 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         type=float,
         metavar="E",
-        help="demand-shape axis: aggregate price elasticity of demand; 0 is a flat "
-        "multiplier with no price response (default: 0 0.10 0.175 0.28)",
+        help="demand-shape axis: aggregate price elasticity of demand "
+        "(default: 0.10 0.175 0.28). 0 is a flat multiplier with no price response "
+        "and is not swept: it cannot shed demand, so above demand level 1 the base "
+        "fee runs to the MAX_BASE_FEE ceiling",
     )
     grid.add_argument(
         "--demand-levels",
@@ -243,15 +218,11 @@ def build_config(args: argparse.Namespace, base: SimConfig = DEFAULT_CONFIG) -> 
         "cache_dir": args.cache_dir,
         "simulation_horizon_blocks": args.horizon,
         "arrival_mode": args.arrival_mode,
-        "drain_blocks": args.drain_blocks,
         "num_bootstrap_runs": args.num_runs,
         "random_seed": args.seed,
         "starting_base_fee": args.starting_base_fee,
         "fusaka_gas_limit": args.fusaka_gas_limit,
         "glamsterdam_gas_limit": args.glamsterdam_gas_limit,
-        "first_glamsterdam_simulation_step": args.first_glamsterdam_step,
-        "tx_inclusion_policy": args.tx_inclusion_policy,
-        "max_rescue_multiplier": args.max_rescue_multiplier,
         "output_dir": args.output_dir,
         "price_ema_blocks": args.price_ema_blocks,
         "demand_multiplier_bounds": (
@@ -284,7 +255,7 @@ def build_grid(args: argparse.Namespace, base: SimulationGrid = SimulationGrid()
 
 class SimulationResult(NamedTuple):
     per_step: pd.DataFrame
-    excluded: pd.DataFrame
+    outcomes: pd.DataFrame
     summary: pd.DataFrame
     window_length: pd.DataFrame
     manifest: dict
@@ -296,11 +267,10 @@ def run_simulation(cfg: SimConfig, grid: SimulationGrid) -> SimulationResult:
     started = time.perf_counter()
 
     with _timed(timings, "load_seconds"):
-        tx_frame = derive_gas_dimensions(load_tx_gas_results(cfg))
-        simulatable, excluded = split_simulatable(
-            tx_frame, cfg.tx_inclusion_policy, cfg.max_rescue_multiplier
-        )
-        excluded = excluded_summary(excluded, simulatable)
+        # Every replay row is demand; the outcome breakdown is a report on what
+        # the trace contains, not a filter applied to it.
+        simulatable = derive_gas_dimensions(load_tx_gas_results(cfg))
+        outcomes = replay_outcome_summary(simulatable)
         # Headers first: the demand model anchors every cohort on the base fee of
         # its own source block, so cohorts cannot be built without them.
         headers = fetch_headers(cfg, simulatable)
@@ -338,7 +308,7 @@ def run_simulation(cfg: SimConfig, grid: SimulationGrid) -> SimulationResult:
     summary = scenario_summary(per_step)
     figure_dir = Path(cfg.output_dir) / "figures"
     with _timed(timings, "write_seconds"):
-        outputs = write_outputs(cfg, per_step, excluded, summary, window_length)
+        outputs = write_outputs(cfg, per_step, outcomes, summary, window_length)
     with _timed(timings, "plot_seconds"):
         bands, reference = (
             per_step[per_step["arrival_mode"] == BOOTSTRAP_MODE],
@@ -361,7 +331,7 @@ def run_simulation(cfg: SimConfig, grid: SimulationGrid) -> SimulationResult:
     manifest_path = Path(cfg.output_dir) / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
     return SimulationResult(
-        per_step, excluded, summary, window_length, manifest, outputs + [manifest_path]
+        per_step, outcomes, summary, window_length, manifest, outputs + [manifest_path]
     )
 
 
@@ -445,7 +415,10 @@ def resolve_starting_base_fee(
 
 
 def scenario_summary(per_step: pd.DataFrame) -> pd.DataFrame:
-    """Per scenario: saturation shares, terminal backlog, and final base fee."""
+    """Per scenario: saturation shares, terminal backlog, and final base fee.
+
+    "Terminal" is the last arrival step, which is where a path now ends.
+    """
     keys = ["arrival_mode", "aggregate_elasticity", "demand_level", "bootstrap_window_blocks"]
     flagged = per_step.assign(
         execution_saturated=per_step["execution_utilization"] >= SATURATION_THRESHOLD,
@@ -460,16 +433,22 @@ def scenario_summary(per_step: pd.DataFrame) -> pd.DataFrame:
         median_demand_multiplier=("realized_demand_multiplier", "median"),
         max_demand_multiplier=("realized_demand_multiplier", "max"),
         multiplier_clamped_share=("demand_multiplier_clamped", "mean"),
+        # Non-zero means the base fee ran into `config.MAX_BASE_FEE`, so this
+        # scenario could not shed demand and its fees are not interpretable.
+        base_fee_clamped_share=("base_fee_clamped", "mean"),
     )
     terminal = (
         flagged.sort_values("simulation_position")
         .groupby(keys + ["run_index"], observed=True)
         .tail(1)
-        .assign(backlog_cleared=lambda f: f["backlog_tx_count"] == 0)
+        .assign(ended_empty=lambda f: f["backlog_tx_count"] == 0)
     )
     outcome = terminal.groupby(keys, observed=True).agg(
         runs=("run_index", "nunique"),
-        backlog_cleared_share=("backlog_cleared", "mean"),
+        # Share of runs whose *last arrival block* left nothing queued. Not a
+        # drain result: the run stops with the last arrival, so this says demand
+        # fitted inside capacity at the end, not how fast a queue would clear.
+        ended_empty_share=("ended_empty", "mean"),
         median_terminal_backlog_txs=("backlog_tx_count", "median"),
         max_terminal_backlog_txs=("backlog_tx_count", "max"),
         final_base_fee_wei=("base_fee_per_gas", "median"),
@@ -482,7 +461,7 @@ def scenario_summary(per_step: pd.DataFrame) -> pd.DataFrame:
 def write_outputs(
     cfg: SimConfig,
     per_step: pd.DataFrame,
-    excluded: pd.DataFrame,
+    outcomes: pd.DataFrame,
     summary: pd.DataFrame,
     window_length: pd.DataFrame,
 ) -> list[Path]:
@@ -492,13 +471,13 @@ def write_outputs(
     per_step.to_csv(paths[0], index=False)
     per_step.to_parquet(paths[1], index=False)
 
-    excluded_path = out_dir / "excluded_summary.csv"
-    excluded.to_csv(excluded_path)
+    outcomes_path = out_dir / "replay_outcome_summary.csv"
+    outcomes.to_csv(outcomes_path)
     summary_path = out_dir / "scenario_summary.csv"
     summary.to_csv(summary_path, index=False)
     window_path = out_dir / "window_length.csv"
     window_length.to_csv(window_path, index=False)
-    return paths + [excluded_path, summary_path, window_path]
+    return paths + [outcomes_path, summary_path, window_path]
 
 
 def run_manifest(
@@ -539,11 +518,11 @@ def main(argv: list[str] | None = None) -> int:
     grid = build_grid(args)
     result = run_simulation(cfg, grid)
 
-    print(_banner("EXCLUDED REPLAY ROWS (not simulatable)"))
+    print(_banner("REPLAY OUTCOME MIX (every row is simulated; nothing is excluded)"))
     print(
-        result.excluded.to_string()
-        if not result.excluded.empty
-        else "no rows excluded: every replay row succeeded in both baseline and schedule"
+        result.outcomes.to_string()
+        if not result.outcomes.empty
+        else "empty trace: no replay rows in range"
     )
     print(_banner("BOOTSTRAP BLOCK LENGTH (L) SUPPORTED BY COHORT AUTOCORRELATION"))
     print(result.window_length.to_string(index=False, float_format=lambda v: f"{v:,.2f}"))

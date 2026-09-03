@@ -91,10 +91,10 @@ def test_block_gas_used_is_the_binding_dimension():
     assert loader.block_gas_used(selected.iloc[:0]) == 0
 
 
-# --- Simulatable / excluded split -------------------------------------------------
+# --- Replay outcome reporting -----------------------------------------------------
 
 
-def test_split_simulatable_keeps_only_doubly_successful_rows():
+def test_replay_outcome_classifies_every_row():
     frame = _frame(
         baseline_success=[1, 1, 0, 0],
         schedule_success=[1, 0, 1, 0],
@@ -102,18 +102,17 @@ def test_split_simulatable_keeps_only_doubly_successful_rows():
         state_gas=[1, 2, 3, 4],
         schedule_gas_used=[5, 6, 7, 8],
     )
-    selected, excluded = loader.split_simulatable(frame, policy="successful_only")
-    assert selected["execution_gas"].tolist() == [10]
     # With no `min_multiplier_to_succeed` column there is no rescue evidence, so a
     # schedule failure cannot be attributed to a too-small gas limit.
-    assert excluded["exclusion_reason"].tolist() == [
+    assert loader.replay_outcome(frame).tolist() == [
+        "simulatable",
         "schedule_halted_regardless",
         "baseline_only_failure",
         "both_failed",
     ]
 
 
-def test_excluded_summary_reports_counts_and_gas_shares():
+def test_replay_outcome_summary_reports_counts_and_gas_shares():
     frame = _frame(
         baseline_success=[1, 1, 0, 0],
         schedule_success=[1, 0, 1, 0],
@@ -121,30 +120,30 @@ def test_excluded_summary_reports_counts_and_gas_shares():
         state_gas=[1, 2, 3, 5],
         schedule_gas_used=[5, 6, 7, 9],
     )
-    _, excluded = loader.split_simulatable(frame, policy="successful_only")
-    summary = loader.excluded_summary(excluded)
+    summary = loader.replay_outcome_summary(frame)
 
-    assert list(summary.index) == list(loader.EXCLUSION_REASONS)
-    assert summary["tx_count"].sum() == 3
+    assert list(summary.index) == list(loader.REPLAY_OUTCOMES)
+    # Nothing is filtered out, so the shares are of the whole trace.
+    assert summary["tx_count"].sum() == 4
+    assert summary.loc["simulatable", "execution_gas"] == 10
     assert summary.loc["both_failed", "execution_gas"] == 50
     assert summary["execution_gas_share"].sum() == pytest.approx(1.0)
-    assert summary.loc["both_failed", "execution_gas_share"] == pytest.approx(50 / 100)
+    assert summary.loc["both_failed", "execution_gas_share"] == pytest.approx(50 / 110)
 
 
-def test_excluded_summary_on_an_empty_frame_is_empty_not_an_error():
-    summary = loader.excluded_summary(pd.DataFrame(columns=["exclusion_reason"]))
+def test_replay_outcome_summary_on_an_empty_frame_is_empty_not_an_error():
+    summary = loader.replay_outcome_summary(pd.DataFrame(columns=["baseline_success"]))
     assert summary.empty
     assert "execution_gas_share" in summary.columns
 
 
-def test_dummy_trace_has_both_simulatable_and_excluded_rows(raw_rows):
-    selected, excluded = loader.split_simulatable(
-        loader.derive_gas_dimensions(loader.normalize_dtypes(raw_rows)),
-        policy="successful_only",
-    )
-    assert len(selected) > 0 and len(excluded) > 0
-    assert len(selected) + len(excluded) == len(raw_rows)
-    assert loader.excluded_summary(excluded)["tx_count"].sum() == len(excluded)
+def test_dummy_trace_covers_more_than_one_replay_outcome(raw_rows):
+    frame = loader.derive_gas_dimensions(loader.normalize_dtypes(raw_rows))
+    summary = loader.replay_outcome_summary(frame)
+
+    # Every row is simulated, and the fixture exercises several outcomes.
+    assert summary["tx_count"].sum() == len(raw_rows)
+    assert (summary["tx_count"] > 0).sum() > 1
 
 
 # --- Dataset identity guard -------------------------------------------------------
@@ -458,7 +457,7 @@ def test_starting_base_fee_on_the_dummy_header_frame(offline_cfg, offline_data):
     )
 
 
-# --- Gas-rescued inclusion policy -------------------------------------------------
+# --- Rescuable rows, reported rather than filtered --------------------------------
 
 
 def _rescue_frame() -> pd.DataFrame:
@@ -472,12 +471,14 @@ def _rescue_frame() -> pd.DataFrame:
     )
 
 
-def test_strict_policy_drops_every_schedule_failure():
-    selected, excluded = loader.split_simulatable(
-        _rescue_frame(), policy="successful_only"
-    )
-    assert selected["execution_gas"].tolist() == [10]
-    assert excluded["exclusion_reason"].tolist() == [
+def test_replay_outcome_separates_rescuable_rows_from_real_halts():
+    """The distinction that dominates the analysis; now reported, never a filter.
+
+    A baseline failure is never called rescuable: a larger gas limit only forgives
+    a too-small limit, not a transaction that was already broken.
+    """
+    assert loader.replay_outcome(_rescue_frame()).tolist() == [
+        "simulatable",
         "schedule_gas_rescuable",
         "schedule_gas_rescuable",
         "schedule_halted_regardless",
@@ -485,33 +486,19 @@ def test_strict_policy_drops_every_schedule_failure():
     ]
 
 
-def test_gas_rescued_policy_keeps_limit_censored_rows_but_not_real_halts():
-    selected, excluded = loader.split_simulatable(_rescue_frame(), policy="gas_rescued")
-    assert selected["execution_gas"].tolist() == [10, 20, 30]
-    # The rescued rows are where the state gas lives; this is the whole point.
-    assert selected["state_gas"].sum() == 501
-    assert excluded["exclusion_reason"].tolist() == [
-        "schedule_halted_regardless",
-        "both_failed",
-    ]
+def test_every_row_is_simulated_whatever_multiplier_it_needed():
+    """No row is dropped for failing, nor for how much extra gas limit it needed.
 
+    That includes the row censored at `RESCUE_SWEEP_CEILING`, which needed *at
+    least* that multiplier -- it is simulated like any other.
+    """
+    frame = _rescue_frame()
+    summary = loader.replay_outcome_summary(frame)
 
-def test_max_rescue_multiplier_bounds_the_assumed_limit_increase():
-    selected, _ = loader.split_simulatable(
-        _rescue_frame(), policy="gas_rescued", max_rescue_multiplier=5.0
-    )
-    assert selected["execution_gas"].tolist() == [10, 20]
-
-
-def test_a_baseline_failure_is_never_rescued():
-    """Rescue only forgives a too-small gas limit, not a broken baseline."""
-    selected, _ = loader.split_simulatable(_rescue_frame(), policy="gas_rescued")
-    assert 50 not in selected["execution_gas"].tolist()
-
-
-def test_all_policy_keeps_every_row_including_failures():
-    selected, excluded = loader.split_simulatable(_rescue_frame(), policy="all")
-    assert len(selected) == 5 and excluded.empty
+    assert summary["tx_count"].sum() == len(frame)
+    assert summary["state_gas"].sum() == frame["state_gas"].sum() == 510
+    # The rescuable rows are where the state gas lives; this is the whole point.
+    assert summary.loc["schedule_gas_rescuable", "state_gas"] == 500
 
 
 def test_capacity_stays_on_the_pre_refund_basis_not_schedule_gas_used():

@@ -39,7 +39,7 @@ python3.12 -m venv .venv
     --analysis-config-hash <hash> --block-range <first> <last> \
     --reference-start-block <block> --num-runs 20
 
-.venv/bin/python -m pytest -q     # 166 tests, offline
+.venv/bin/python -m pytest -q     # offline, no credentials needed
 ```
 
 `--analysis-config-hash` is mandatory: it pins one reth replay configuration, so a
@@ -68,8 +68,6 @@ in its `manifest.json`.
 | `--block-range FIRST LAST` | Inclusive source block range. Required — unbounded scans of the replay table are refused. | — |
 | `--reference-start-block N` | First block of the historical path; its **parent** supplies the starting base fee. | first block of the range |
 | `--cache-dir PATH` | Parquet cache for fetched data. | `data/cache` |
-| `--tx-inclusion-policy {all,gas_rescued,successful_only}` | Which replay rows count as demand. `all` simulates every transaction including failures; `gas_rescued` drops only those that halted for a non-gas reason; `successful_only` is the strict rule. | `all` |
-| `--max-rescue-multiplier M` | Exclude transactions needing more than `M` times their signed gas limit to succeed. | no cap |
 
 **Simulation** — how one path is run.
 
@@ -77,13 +75,11 @@ in its `manifest.json`.
 | --- | --- | --- |
 | `--horizon N` | Arrival steps, i.e. how many cohorts are fed in. | trace length |
 | `--arrival-mode {historical,moving_block_bootstrap}` | `historical` replays the trace once, with no bands; the bootstrap resamples cohort windows. | `moving_block_bootstrap` |
-| `--drain-blocks N` | Blocks simulated after arrivals stop, to see whether the backlog clears. | `0` |
 | `--num-runs N` | Bootstrap paths per grid cell — the width of the p10–p90 band. | `20` |
 | `--seed N` | Master seed; every stream derives from it, so a simulation is reproducible. | `20260831` |
 | `--starting-base-fee WEI` | Override the base fee at step 0. | parent header |
 | `--fusaka-gas-limit N` | Gas limit at step 0. | `60,000,000` |
 | `--glamsterdam-gas-limit N` | Ceiling the 1/1024 ramp climbs toward. | `200,000,000` |
-| `--first-glamsterdam-step N` | Step at which the ramp starts; earlier steps hold `--fusaka-gas-limit`. Repriced gas applies at every step regardless. | `0` |
 
 **Demand model** — how much demand arrives, and what it is willing to pay.
 
@@ -94,12 +90,12 @@ in its `manifest.json`.
 | `--no-bid-adaptation` | Freeze historical fee caps instead of repricing them from their own block's base fee to the simulated one. Makes the fee filter, not the elasticity, set how much demand is eligible. | off |
 
 **Simulation grid** — every combination of the three axes is a scenario, each run
-`--num-runs` times. The two demand axes multiply, so the defaults are 48 cells;
+`--num-runs` times. The two demand axes multiply, so the defaults are 36 cells;
 narrow them explicitly on a long trace.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
-| `--elasticities E [E ...]` | Demand-*shape* axis: aggregate price elasticity. `0` is a flat multiplier with no price response. | `0 0.10 0.175 0.28` |
+| `--elasticities E [E ...]` | Demand-*shape* axis: aggregate price elasticity. `0` is a flat multiplier with no price response, and is no longer swept by default: with bid adaptation on it cannot shed demand above `--demand-levels 1`, so the base fee runs to the `MAX_BASE_FEE` ceiling and `base_fee_clamped_share` goes non-zero. | `0.10 0.175 0.28` |
 | `--demand-levels A [A ...]` | Demand-*level* axis: latent-demand multiplier at the anchor price, standing in for never-included and secular-growth demand. | `1 1.5 2 3` |
 | `--window-blocks L [L ...]` | Bootstrap axis: length in cohorts of each resampled window. | `16 32 64` |
 | `--no-historical` | Skip the historical reference path (bands only). | off |
@@ -115,10 +111,12 @@ Written to `--output-dir`. Every column is documented in `METHODOLOGY.md` §8.
   dimension, eligible / fee-ineligible backlog by count and both gas dimensions,
   and the demand model's own state.
 - `scenario_summary.csv` — per demand scenario: saturation share by dimension,
-  median and max realized multiplier, clamped share, whether backlog cleared,
-  terminal backlog, final base fee.
-- `excluded_summary.csv` — replay rows the inclusion policy rejected, and what
-  share of the dataset they are.
+  median and max realized multiplier, multiplier and base-fee clamped shares,
+  whether anything was left queued at the last arrival, terminal backlog, final
+  base fee.
+- `replay_outcome_summary.csv` — the whole trace broken down by how each row fared
+  in the replay. Nothing is excluded; this reports what is being simulated, and in
+  particular how much state gas sits in gas-rescuable rows.
 - `window_length.csv` — the autocorrelation argument for the bootstrap block
   length `L`.
 - `manifest.json` — resolved config, grid, seeds, library versions, timings.

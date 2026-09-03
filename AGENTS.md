@@ -160,9 +160,8 @@ Model in `METHODOLOGY.md` §6.
 
 - **Both persistent-state updates are parent-derived.** Neither the base fee nor
   the ramp is applied at position 0, so the first recorded block reports the
-  configured initial state verbatim. From then on the ramp applies at
-  `first_glamsterdam_simulation_step` itself, with no activation delay, via
-  `position >= max(1, first_glamsterdam_simulation_step)`.
+  configured initial state verbatim and the ramp first applies at position 1.
+  Glamsterdam is always live from position 0; there is no activation step.
 - **`tx_hash` is not carried through cohorts or expansion.** A week is ~8M rows and
   object-dtype hashes cost ~1 GB. Identity is `(run_index, window_instance,
   source_block_number, tx_index, replica_index)`, 1:1 with a `tx_hash`-based one.
@@ -176,11 +175,11 @@ Model in `METHODOLOGY.md` §6.
   sticks at 7 wei or below on its own arithmetic; the floor binds only from exactly
   0, reachable only via `--starting-base-fee 0`. It is therefore *not* what bounds
   the demand multiplier — `--multiplier-bounds` does that job.
-- **`build_cohorts` does not re-filter rows.** Which rows count as demand is
-  entirely `split_simulatable`'s decision; re-applying a success filter here would
-  silently undo `--tx-inclusion-policy`. It only refuses an empty frame.
-- **Cohorts are positional and may skip block numbers** (a source block whose every
-  row was filtered out has no cohort), so bootstrap windows are contiguous in
+- **`build_cohorts` does not filter rows.** Every replay row is demand, failures
+  included; there is no inclusion policy anywhere in the pipeline, so applying a
+  success filter here would invent one. It only refuses an empty frame.
+- **Cohorts are positional and may skip block numbers** (a source block with no
+  replay rows has no cohort), so bootstrap windows are contiguous in
   *cohort index*, not block number. The induced sampling remainder is drawn from
   the step's whole window rather than the arriving cohort, which would make it a
   near copy of one block; under `historical` the pool is a trailing window instead.
@@ -264,7 +263,8 @@ implementations, and compaction cadence is asserted not to change output.
    per transaction, so `median_max_priority_fee_per_gas` decorrelates in ~1 block —
    an artifact, not a finding.
 4. **`baseline_only_failure` is always empty on dummy data** by construction, so
-   that branch of `excluded_summary` is unit-tested but never exercised end to end.
+   that row of `replay_outcome_summary` is unit-tested but never exercised end to
+   end.
 5. **The dataset is still being written**, so a cached extract and a fresh query can
    disagree. Only one `analysis_config_hash` and one schedule exist so far, so the
    hash-mixing guard has never fired on real data.

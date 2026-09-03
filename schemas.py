@@ -95,7 +95,6 @@ PER_STEP_IDENTITY_COLUMNS = (
     "demand_level",
     "bootstrap_window_blocks",
     "simulation_position",
-    "is_drain_step",
     "source_block_number",
     "window_instance",
     "position_in_window",
@@ -113,6 +112,10 @@ PER_STEP_DEMAND_COLUMNS = (
 
 PER_STEP_METRIC_COLUMNS = (
     "base_fee_per_gas",
+    # Marks a step sitting at `config.MAX_BASE_FEE`. Like
+    # `demand_multiplier_clamped`, it says the bound rather than the mechanism set
+    # this value, so any scenario with a non-zero share has uninterpretable fees.
+    "base_fee_clamped",
     "gas_limit",
     "gas_used",
     "block_execution_gas_used",

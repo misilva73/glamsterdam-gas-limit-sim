@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from config import DEFAULT_CONFIG, MIN_BASE_FEE, SimConfig
+from config import DEFAULT_CONFIG, MAX_BASE_FEE, MIN_BASE_FEE, SimConfig
 from tests.dummy import dummy_tx_gas_results
 from schemas import (
     BOTTLENECK_EXECUTION,
@@ -133,6 +133,69 @@ def test_the_base_fee_never_falls_below_one_wei():
     # only via an explicit --starting-base-fee 0.
     assert next_base_fee(0, 0, 60_000_000) == MIN_BASE_FEE == 1
     assert next_base_fee(0, 30_000_000, 60_000_000) == 1  # the at-target branch
+
+
+def test_the_base_fee_never_rises_above_the_ceiling():
+    """MAX_BASE_FEE, the guard the protocol itself does not have."""
+    # Well below the ceiling the update is untouched protocol arithmetic.
+    assert next_base_fee(8 * GWEI, 60_000_000, 60_000_000) == 9 * GWEI
+    # A full block one step under the ceiling is held at it, not past it.
+    assert next_base_fee(MAX_BASE_FEE, 60_000_000, 60_000_000) == MAX_BASE_FEE
+    just_under = MAX_BASE_FEE - MAX_BASE_FEE // 16
+    assert next_base_fee(just_under, 60_000_000, 60_000_000) == MAX_BASE_FEE
+    # The at-target branch clamps too, so an over-ceiling starting fee is pulled in.
+    assert next_base_fee(2 * MAX_BASE_FEE, 30_000_000, 60_000_000) == MAX_BASE_FEE
+    # Clamping never blocks the way back down.
+    assert next_base_fee(MAX_BASE_FEE, 0, 60_000_000) < MAX_BASE_FEE
+
+
+def test_a_scenario_that_cannot_shed_demand_clamps_instead_of_overflowing():
+    """The elasticity-0 regression: flat demand plus bid adaptation ran away.
+
+    With no price response the multiplier is flat, and bid adaptation preserves
+    eligibility, so nothing sheds demand: blocks stay full and the base fee
+    compounds every block. It used to overflow int64 in `adapt_bids` after ~213
+    blocks; now it pins at the ceiling and says so.
+    """
+    # Four 21k rows per block against a 100k limit: demand outruns capacity every
+    # block, so gas used stays above the 50k target and the fee only climbs.
+    frame = tx_frame(
+        *[dict(block_number=100 + i) for i in range(20) for _ in range(4)]
+    )
+    cfg = priced_config(
+        aggregate_elasticity=0.0,
+        demand_level=2.0,
+        adapt_bids=True,
+        fusaka_gas_limit=100_000,
+        glamsterdam_gas_limit=100_000,
+    )
+    steps = run_priced(frame, cfg, anchor_base_fee=GWEI, base_fee=MAX_BASE_FEE // 2)
+
+    assert steps["base_fee_per_gas"].max() == MAX_BASE_FEE
+    assert steps["base_fee_clamped"].any()
+    # The flag marks exactly the steps sitting at the ceiling, and nothing else.
+    at_ceiling = steps["base_fee_per_gas"] == MAX_BASE_FEE
+    assert steps["base_fee_clamped"].tolist() == at_ceiling.tolist()
+
+
+def test_bid_adaptation_does_not_wrap_a_fee_cap_near_int64():
+    """The guard on the legacy branch, which the ceiling does not cover.
+
+    The ceiling fixes the `OverflowError`, which came from a base fee too large
+    for a C long. This is the quieter sibling: shifting a cap already near
+    int64_max wraps to a *negative* cap, which would silently make an eligible
+    transaction ineligible instead of raising.
+    """
+    frame = tx_frame(
+        dict(tx_type=0, max_fee_per_gas=2**63 - 1),  # legacy: shifted branch
+        dict(tx_type=2, max_fee_per_gas=2**63 - 1),  # dynamic fee: scaled branch
+    )
+    cfg = priced_config(aggregate_elasticity=0.0, demand_level=1.0, adapt_bids=True)
+    steps = run_priced(frame, cfg, anchor_base_fee=1, base_fee=MAX_BASE_FEE)
+
+    # Both rows bid far above the base fee, so both are still eligible and land
+    # in the block. A wrapped cap would drop the legacy row.
+    assert steps.loc[0, "included_tx_count"] == 2
 
 
 def test_effective_tip_by_transaction_type():
@@ -297,10 +360,15 @@ def test_sender_gas_and_priority_fees_are_post_refund_amounts():
 
 
 def test_fee_ineligible_demand_waits_for_the_base_fee_to_fall():
+    # One cheap row per source block, so every step arrives demand that cannot
+    # pay yet and the blocks stay empty while the fee decays.
     frame = tx_frame(
-        dict(max_fee_per_gas=50 * GWEI, execution_gas=21_000, state_gas=5_000)
+        *[
+            dict(block_number=100 + i, max_fee_per_gas=50 * GWEI, state_gas=5_000)
+            for i in range(12)
+        ]
     )
-    cfg = fixed_limit_config(60_000_000, drain_blocks=10)
+    cfg = fixed_limit_config(60_000_000)
     steps = run(frame, cfg, base_fee=100 * GWEI)
 
     ineligible = steps["backlog_fee_ineligible_tx_count"].to_numpy()
@@ -309,28 +377,29 @@ def test_fee_ineligible_demand_waits_for_the_base_fee_to_fall():
     assert steps.loc[0, "backlog_fee_ineligible_state_gas"] == 5_000
     assert steps.loc[0, "backlog_eligible_tx_count"] == 0
 
-    # Empty blocks decay the base fee 12.5% per block until the cap clears.
-    included_at = steps.index[steps["included_tx_count"] == 1]
-    assert len(included_at) == 1
-    first = int(included_at[0])
+    # Empty blocks decay the base fee 12.5% per block until the caps clear, and
+    # then the whole waiting queue goes in at once.
+    first = int(steps.index[steps["included_tx_count"] > 0][0])
     assert steps.loc[first, "base_fee_per_gas"] <= 50 * GWEI
     assert steps.loc[first - 1, "base_fee_per_gas"] > 50 * GWEI
+    assert steps.loc[first, "included_tx_count"] == first + 1
     assert (ineligible[first:] == 0).all()
-    assert steps.loc[first, "gas_used"] == 21_000
 
 
 # --- Gas-limit trajectory ---------------------------------------------------------
 
 
-def test_gas_limit_is_flat_before_the_glamsterdam_step_then_ramps():
+def test_the_gas_limit_ramps_from_the_first_non_initial_block():
+    """Glamsterdam is always live from step 0; there is no activation step."""
     frame = tx_frame(*[dict(block_number=100 + i) for i in range(8)])
-    cfg = mechanism_config(arrival_mode="historical", first_glamsterdam_simulation_step=5)
+    cfg = mechanism_config(arrival_mode="historical")
     limits = run(frame, cfg, base_fee=GWEI)["gas_limit"].tolist()
 
-    # No activation delay: the bump lands on the configured step itself.
-    assert limits[:5] == [60_000_000] * 5
-    assert limits[5] == 60_000_000 + 60_000_000 // 1024
-    assert limits[6] > limits[5]
+    # Position 0 reports the configured initial state; the ramp starts at 1.
+    assert limits[0] == 60_000_000
+    assert limits[1] == 60_000_000 + 60_000_000 // 1024
+    assert limits == sorted(limits)
+    assert limits[2] > limits[1]
     assert max(limits) < 200_000_000
 
 
@@ -386,25 +455,29 @@ def test_legacy_rows_are_priced_by_gas_price_not_a_zero_priority_fee():
     assert steps.loc[0, "priority_fees_wei"] == pytest.approx(40 * GWEI * 21_000)
 
 
-# --- Drain phase and determinism --------------------------------------------------
+# --- End of a run, and determinism ------------------------------------------------
 
 
-def test_drain_phase_adds_no_arrivals_and_clears_the_backlog():
+def test_a_run_ends_with_the_last_arrival_and_discards_what_is_queued():
+    """There is no drain phase: the leftover queue is simply dropped.
+
+    How long that queue would take to clear is `backlog / gas_limit` blocks of
+    arithmetic, so simulating it adds nothing the backlog columns do not say.
+    """
     rows = [dict(execution_gas=400_000, schedule_gas_used=400_000) for _ in range(6)]
-    cfg = fixed_limit_config(1_000_000, drain_blocks=3)
+    cfg = fixed_limit_config(1_000_000)
     steps = run(tx_frame(*rows), cfg)
 
-    assert steps["is_drain_step"].tolist() == [False, True, True, True]
+    # Six rows share one source block, so there is one cohort and one step.
+    assert len(steps) == 1
     assert steps.loc[0, "included_tx_count"] == 2
-    assert steps.loc[1:, "arrived_tx_count"].eq(0).all()
-    assert steps.loc[1:, ["source_block_number", "window_instance", "position_in_window"]].isna().all().all()
-    assert steps["backlog_tx_count"].tolist() == [4, 2, 0, 0]
-    # Backlog gas is carried incrementally across steps: check it against the
-    # arithmetic that arrivals minus inclusions implies.
-    assert steps["backlog_execution_gas"].tolist() == [1_600_000, 800_000, 0, 0]
-    assert steps["backlog_eligible_execution_gas"].tolist() == [1_600_000, 800_000, 0, 0]
-    assert (steps["backlog_state_gas"] == 0).all()
-    assert steps.loc[3, "bottleneck_dimension"] == BOTTLENECK_NONE
+    assert steps.loc[0, "backlog_tx_count"] == 4
+    assert steps.loc[0, "backlog_execution_gas"] == 1_600_000
+    assert steps.loc[0, "backlog_eligible_execution_gas"] == 1_600_000
+    assert steps.loc[0, "backlog_state_gas"] == 0
+    # Every step arrives a cohort now, so the identity columns are never null.
+    identity = ["source_block_number", "window_instance", "position_in_window"]
+    assert steps[identity].notna().all().all()
 
 
 @pytest.fixture(scope="module")
@@ -413,7 +486,7 @@ def dummy_cohorts():
 
 
 def test_same_seed_and_config_reproduce_an_identical_frame(dummy_cohorts):
-    cfg = mechanism_config(demand_level=1.5, bootstrap_window_blocks=16, drain_blocks=3)
+    cfg = mechanism_config(demand_level=1.5, bootstrap_window_blocks=16)
     path = bootstrap_path(dummy_cohorts, 40, cfg.bootstrap_window_blocks, np.random.default_rng(4))
 
     first = run_path(dummy_cohorts, path, cfg, run_index=0, starting_base_fee=8 * GWEI)
@@ -428,25 +501,23 @@ def test_same_seed_and_config_reproduce_an_identical_frame(dummy_cohorts):
 
 def test_backlog_gas_conserves_arrivals_minus_inclusions(dummy_cohorts):
     """Every gas unit that arrives is either included or still in the backlog."""
-    cfg = mechanism_config(arrival_mode="historical", drain_blocks=4)
+    cfg = mechanism_config(arrival_mode="historical")
     path = historical_path(dummy_cohorts, 40)
     steps = run_path(dummy_cohorts, path, cfg, run_index=0, starting_base_fee=8 * GWEI)
 
     for dimension in ("execution_gas", "state_gas"):
         arrived = np.array(
-            [dummy_cohorts.cohort(i)[dimension].sum() for i in path["cohort_index"]] + [0] * 4
+            [dummy_cohorts.cohort(i)[dimension].sum() for i in path["cohort_index"]]
         )
         used = steps[f"block_{dimension.replace('_gas', '')}_gas_used"].to_numpy()
         assert (steps[f"backlog_{dimension}"].to_numpy() == np.cumsum(arrived - used)).all()
-
-    assert steps["backlog_tx_count"].iloc[-1] < steps["backlog_tx_count"].max()
 
 
 def test_mempool_compaction_cadence_does_not_change_results(dummy_cohorts, monkeypatch):
     """Tombstoning is an optimisation: when it is collected must not matter."""
     import sim.engine as engine
 
-    cfg = mechanism_config(demand_level=2.5, bootstrap_window_blocks=16, drain_blocks=10)
+    cfg = mechanism_config(demand_level=2.5, bootstrap_window_blocks=16)
     path = bootstrap_path(dummy_cohorts, 60, 16, np.random.default_rng(5))
     run = lambda: run_path(dummy_cohorts, path, cfg, run_index=0, starting_base_fee=8 * GWEI)
 
@@ -457,13 +528,13 @@ def test_mempool_compaction_cadence_does_not_change_results(dummy_cohorts, monke
 
 
 def test_end_to_end_run_on_dummy_data(dummy_cohorts):
-    cfg = mechanism_config(demand_level=2.0, bootstrap_window_blocks=16, drain_blocks=5)
+    cfg = mechanism_config(demand_level=2.0, bootstrap_window_blocks=16)
     path = bootstrap_path(dummy_cohorts, 60, cfg.bootstrap_window_blocks, np.random.default_rng(0))
     steps = run_path(dummy_cohorts, path, cfg, run_index=3, starting_base_fee=8 * GWEI)
 
     assert tuple(steps.columns) == PER_STEP_COLUMNS
-    assert len(steps) == 65
-    assert steps["simulation_position"].tolist() == list(range(65))
+    assert len(steps) == 60
+    assert steps["simulation_position"].tolist() == list(range(60))
     assert (steps["run_index"] == 3).all()
     assert (steps["arrival_mode"] == cfg.arrival_mode).all()
     assert (steps["gas_used"] <= steps["gas_limit"]).all()
@@ -558,21 +629,20 @@ def test_the_engine_applies_the_multiplier_the_demand_model_specifies(dummy_coho
     """Exact wiring check: every step's multiplier is the model's own answer."""
     priced = anchored_cohorts(num_blocks=40, seed=21)
     cfg = priced_config(aggregate_elasticity=0.175, demand_level=1.2, price_ema_blocks=8)
-    steps = run_priced_cohorts(priced, cfg, base_fee=4 * GWEI, drain=3)
+    steps = run_priced_cohorts(priced, cfg, base_fee=4 * GWEI)
 
-    arrivals = steps[~steps["is_drain_step"]]
     expected = [
         demand_multiplier(cfg, row.demand_price_signal, row.cohort_anchor_price)[0]
-        for row in arrivals.itertuples()
+        for row in steps.itertuples()
     ]
-    assert arrivals["realized_demand_multiplier"].tolist() == pytest.approx(expected)
+    assert steps["realized_demand_multiplier"].tolist() == pytest.approx(expected)
 
 
-def run_priced_cohorts(cohorts, cfg: SimConfig, *, base_fee: int, drain: int = 0):
+def run_priced_cohorts(cohorts, cfg: SimConfig, *, base_fee: int):
     return run_path(
         cohorts,
         historical_path(cohorts, len(cohorts)),
-        cfg.with_(drain_blocks=drain),
+        cfg,
         run_index=0,
         starting_base_fee=base_fee,
     )
@@ -642,20 +712,18 @@ def test_bid_adaptation_makes_a_cohort_includable_at_a_far_higher_base_fee():
     assert adapted.loc[0, "priority_fees_wei"] == pytest.approx(GWEI * 21_000)
 
 
-def test_drain_steps_record_no_demand_because_no_cohort_arrives():
+def test_every_step_records_a_drawn_demand_response():
+    """With no drain phase there are no stepless-demand rows left to be null."""
     priced = anchored_cohorts(num_blocks=20, seed=31)
     steps = run_priced_cohorts(
-        priced, priced_config(aggregate_elasticity=0.175), base_fee=8 * GWEI, drain=4
+        priced, priced_config(aggregate_elasticity=0.175), base_fee=8 * GWEI
     )
 
-    drain = steps[steps["is_drain_step"]]
-    assert len(drain) == 4
-    assert drain["realized_demand_multiplier"].isna().all()
-    assert drain["cohort_anchor_price"].isna().all()
-    assert not drain["demand_multiplier_clamped"].any()
-    assert (drain[["arrived_tx_count", "arrived_execution_gas", "arrived_state_gas"]] == 0).all().all()
-    # The price signal keeps updating: the drain phase still has a base fee.
-    assert drain["demand_price_signal"].notna().all()
+    assert len(steps) == 20
+    assert steps["realized_demand_multiplier"].notna().all()
+    assert steps["cohort_anchor_price"].notna().all()
+    assert steps["demand_price_signal"].notna().all()
+    assert (steps["arrived_tx_count"] > 0).all()
 
 
 def test_the_clamp_is_recorded_when_the_price_leaves_the_estimation_range():
@@ -674,7 +742,7 @@ def test_arrived_gas_is_recorded_and_conserved_against_the_backlog():
     """Sampling makes arrivals unrecoverable from the path, so they are output."""
     priced = anchored_cohorts(num_blocks=40, seed=17)
     steps = run_priced_cohorts(
-        priced, priced_config(aggregate_elasticity=0.175), base_fee=8 * GWEI, drain=6
+        priced, priced_config(aggregate_elasticity=0.175), base_fee=8 * GWEI
     )
 
     for dimension in ("execution", "state"):

@@ -114,7 +114,7 @@ The engine ultimately needs:
 | `block_number`, `tx_index` | cohort membership and deterministic order |
 | `tx_type`, fee-cap fields | eligibility and effective tip |
 | schedule total, state, floor, and used gas | capacity dimensions and sender cost |
-| baseline/schedule success, rescue multiplier | inclusion policy |
+| baseline/schedule success, rescue multiplier | replay-outcome classification (§4.1) |
 
 The loader also preserves transaction and producer provenance for analysis and
 cache auditing. `schemas.TX_GAS_RESULT_FIELDS` and
@@ -175,22 +175,29 @@ explicit block range and retain both the cache and its sidecar.
 
 ### 4.1 Which replay rows count as demand
 
-`tx_inclusion_policy` controls which replay rows enter cohorts:
+**Every replay row does.** There is no inclusion policy and no filter: a failed
+transaction still occupies block space and still pays, so it is real demand. Its
+gas figures come from whichever replay run the producer recorded — the rescued run
+where one succeeded, the original otherwise. Nothing is dropped for failing, and
+nothing is dropped for how much extra gas limit it would have needed.
 
-| Policy | Rows kept | Interpretation |
-| --- | --- | --- |
-| `all` (default) | every row | failures still occupy space and pay; recorded gas may come from a rescued replay |
-| `gas_rescued` | successes plus failures rescued by a larger gas limit | excludes failures not explained by gas limit |
-| `successful_only` | baseline and schedule both succeeded | assumes senders never raise signed gas limits |
+Rows are still *classified* by how they fared in the replay, and the breakdown is
+reported in `replay_outcome_summary.csv`:
 
-`max_rescue_multiplier` can additionally reject rows that require more than the
-chosen multiple of their signed gas limit. `min_multiplier_to_succeed` is a filter
-input, not a gas multiplier: values below one on already-successful transactions
-measure headroom.
+| Outcome | Meaning |
+| --- | --- |
+| `simulatable` | succeeded in both baseline and schedule |
+| `schedule_gas_rescuable` | failed under the schedule, but succeeded once the replay raised the gas limit — censored by the sender's signed limit, not broken |
+| `schedule_halted_regardless` | failed under the schedule at every swept multiplier |
+| `baseline_only_failure` | failed in baseline only |
+| `both_failed` | failed in both |
 
-Excluded rows are classified in `excluded_summary.csv`. The policy is a material
-model choice because excluded failures can contain a disproportionate share of
-state gas.
+This breakdown is a description of the trace, not a choice about it, and it matters
+because `schedule_gas_rescuable` rows can hold a disproportionate share of state
+gas — gas that is only realisable if senders raise their signed limits.
+`min_multiplier_to_succeed` is the evidence for that classification, not a gas
+multiplier: values below one on already-successful transactions measure headroom,
+and values at `RESCUE_SWEEP_CEILING` are censored, meaning *at least* that much.
 
 ### 4.2 The two capacity dimensions
 
@@ -233,14 +240,14 @@ Key defaults are:
 | --- | ---: |
 | initial / target gas limit | 60,000,000 / 200,000,000 |
 | ramp rate | current limit ÷ 1024 per block |
-| elasticities | 0, 0.10, 0.175, 0.28 |
-| demand levels | 1, 1.5, 2, 3 |
+| elasticities | 0.10, 0.175, 0.28 |
+| demand levels | 1, 1.5, 2 |
 | bootstrap windows | 16, 32, 64 cohorts |
 | bootstrap runs per cell | 20 |
 | price EMA span | 300 blocks |
 | price-response bounds | 0.05, 20 |
 
-The defaults form 48 grid cells before repeated runs and historical references.
+The defaults form 27 grid cells before repeated runs and historical references.
 High-demand cells dominate runtime because each block scans a growing mempool.
 
 ## 5. Workload model
@@ -399,12 +406,17 @@ set by the chosen bound and should be treated as unsupported extrapolation.
 
 A path starts with an empty mempool, `starting_base_fee`, `fusaka_gas_limit`, and
 the first cohort's anchor as its price signal. It runs the arrival horizon and then
-optional drain blocks with no arrivals.
+**stops**: whatever is still queued at the last arrival is discarded.
+
+There is no drain phase. How long a leftover queue would take to clear is
+`backlog / gas_limit` blocks of arithmetic rather than a simulation result, and
+whether a backlog is transient or structural is already visible in its trajectory
+across the arrival phase.
 
 At each position:
 
 1. From position 1 onward, update base fee from the previous block and ramp the gas
-   limit if activation has been reached.
+   limit. Glamsterdam is always active from position 0.
 2. Compute the multiplier from the pre-block price signal and current cohort anchor.
 3. Sample arrivals, adapt bids, and append them to the mempool.
 4. Filter fee-eligible transactions, order them, and fill the block.
@@ -412,7 +424,7 @@ At each position:
 6. Update prevailing tip and the price signal for the next position.
 
 The first recorded block therefore uses the configured initial base fee and gas
-limit exactly. The base fee and ramp continue during drain blocks.
+limit exactly.
 
 ### 7.2 Base fee
 
@@ -422,17 +434,34 @@ An upward non-zero change is at least 1 wei; the downward change is not.
 `MIN_BASE_FEE = 1` is a guard, but ordinary integer arithmetic can leave an empty
 chain stuck at 7 wei or below before the guard binds.
 
+`MAX_BASE_FEE = 1e17` wei (0.1 ETH per gas) caps the update. The protocol has no
+such ceiling; this one exists because the 1559 increment is multiplicative. A
+scenario that cannot shed demand — no price response (§6.1) combined with
+eligibility-preserving bid adaptation (§6.4) — saturates every block and raises
+the fee ~12.5% per block without limit, crossing int64 in about 213 blocks and
+crashing in `adapt_bids`.
+
+The ceiling is set where the fee is unambiguously absurd but the arithmetic is
+still safe: ~6 orders of magnitude above any base fee mainnet has seen, and a
+200M-gas block at this fee would burn about 20 million ETH.
+
+Hitting it is a statement about the scenario, never about the chain.
+`base_fee_clamped` marks each step at the ceiling and `base_fee_clamped_share`
+summarizes it — read exactly like `demand_multiplier_clamped` (§6.5): a non-zero
+share means the bound, not the mechanism, set the fees, and they are not
+interpretable.
+
 ### 7.3 Gas-limit ramp
 
-From the activation position onward, each non-initial block applies:
+Each non-initial block applies:
 
 ```text
 next_limit = min(current_limit + floor(current_limit / 1024), target_limit)
 ```
 
 The ramp never lowers a gas limit. Position 0 never ramps because both persistent
-updates are parent-derived. With activation configured as zero, the first increase
-therefore appears at position 1.
+updates are parent-derived, so the first increase appears at position 1. There is
+no activation step: Glamsterdam is live from position 0 in every run.
 
 ### 7.4 Eligibility and ordering
 
@@ -491,9 +520,9 @@ the exact order in `schemas.PER_STEP_COLUMNS`.
 
 | Group | Columns |
 | --- | --- |
-| identity | `arrival_mode`, `run_index`, `aggregate_elasticity`, `demand_level`, `bootstrap_window_blocks`, `simulation_position`, `is_drain_step`, `source_block_number`, `window_instance`, `position_in_window` |
+| identity | `arrival_mode`, `run_index`, `aggregate_elasticity`, `demand_level`, `bootstrap_window_blocks`, `simulation_position`, `source_block_number`, `window_instance`, `position_in_window` |
 | demand | `demand_price_signal`, `cohort_anchor_price`, `realized_demand_multiplier`, `demand_multiplier_clamped` |
-| capacity | `base_fee_per_gas`, `gas_limit`, `gas_used`, `block_execution_gas_used`, `block_state_gas_used`, `execution_utilization`, `state_utilization`, `bottleneck_dimension` |
+| capacity | `base_fee_per_gas`, `base_fee_clamped`, `gas_limit`, `gas_used`, `block_execution_gas_used`, `block_state_gas_used`, `execution_utilization`, `state_utilization`, `bottleneck_dimension` |
 | included | `included_tx_count`, `sender_gas_used`, `priority_fees_wei` |
 | arrivals | `arrived_tx_count`, `arrived_execution_gas`, `arrived_state_gas` |
 | backlog | `backlog_tx_count`, `backlog_eligible_tx_count`, `backlog_fee_ineligible_tx_count`, plus execution/state gas with the same total/eligible/fee-ineligible split |
@@ -507,13 +536,13 @@ Units are wei and gas unless a name states otherwise. `priority_fees_wei` is
 `demand_level`, and `bootstrap_window_blocks`. Its metrics are
 `execution_saturated_share`, `state_saturated_share`,
 `median_demand_multiplier`, `max_demand_multiplier`,
-`multiplier_clamped_share`, `runs`, `backlog_cleared_share`,
+`multiplier_clamped_share`, `base_fee_clamped_share`, `runs`, `ended_empty_share`,
 `median_terminal_backlog_txs`, `max_terminal_backlog_txs`, and
 `median_final_base_fee_gwei`. Saturation means utilisation at or above 99%.
 
 ### 8.3 Other artifacts
 
-- `excluded_summary.csv`: rows rejected by the inclusion policy, by reason.
+- `replay_outcome_summary.csv`: the whole trace broken down by replay outcome (§4.1). Nothing is excluded; this reports what is being simulated.
 - `window_length.csv`: autocorrelation evidence for bootstrap `L`.
 - `manifest.json`: resolved config and grid, seeds, source range, initial base fee,
   library versions, timings, output paths, and the standing caveat.
@@ -521,8 +550,7 @@ Units are wei and gas unless a name states otherwise. `priority_fees_wei` is
   autocorrelation.
 
 Bootstrap figures show p10–p90 bands, min/max whiskers, and a median. The historical
-path is a separate dashed reference; it is never included in bootstrap bands. The
-drain phase is shaded.
+path is a separate dashed reference; it is never included in bootstrap bands.
 
 ## 9. Assumptions
 
@@ -559,14 +587,18 @@ State these whenever reporting results from this repository.
    controls part of the demand response.
 2. `median_demand_multiplier` and `max_demand_multiplier`: these show how far the
    loop moved from the configured demand level.
-3. `backlog_cleared_share` and terminal backlog: these answer whether **price
-   alone**, under this model, restrained demand enough to clear the queue.
+3. `ended_empty_share` and terminal backlog: these say whether **price alone**,
+   under this model, restrained demand enough that nothing was left queued at the
+   last arrival. They are not a drain result -- a run stops with its last
+   arrival, so they describe the state reached, not how fast a queue would clear.
 
 ### Read comparisons, not isolated cells
 
 - `demand_level` changes latent quantity at the anchor price.
-- `aggregate_elasticity` changes sensitivity to price. Elasticity zero is the
-  no-feedback control.
+- `aggregate_elasticity` changes sensitivity to price. Zero is not swept: with no
+  feedback and bid adaptation on, demand cannot be shed at `demand_level > 1` and
+  the base fee runs to `MAX_BASE_FEE` (§7.2). It remains available as a
+  single-scenario setting, where `demand_level <= 1` keeps it meaningful.
 - `L` changes which dependence structure the bootstrap preserves. If conclusions
   change across `L`, consult `window_length.csv`.
 - The historical line shows the original cohort ordering under simulated rules.
@@ -575,8 +607,9 @@ State these whenever reporting results from this repository.
 
 Execution and state utilisation share a denominator and do not add to 100%.
 Compare `bottleneck_dimension` or saturation shares to learn which resource binds.
-Always check `tx_inclusion_policy`, because filtering can change the state-gas mix
-substantially.
+Check `replay_outcome_summary.csv`, because the share of state gas sitting in
+`schedule_gas_rescuable` rows says how much of the simulated demand depends on
+senders raising their signed gas limits.
 
 ### Supported questions
 

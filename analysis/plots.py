@@ -4,7 +4,7 @@ Every figure is a grid of the simulation axes -- one column per `demand_level`,
 one row block per `(aggregate_elasticity, bootstrap_window_blocks)` pair -- so a
 scenario sweep can be read side by side. Bootstrap runs collapse into per
 `simulation_position` quantile bands; the matching historical reference path is
-drawn on top as a dashed line, and the drain phase (if any) is shaded.
+drawn on top as a dashed line.
 
 The two demand axes multiply, so sweeping all three axes at their defaults makes
 a very tall figure. Narrow the grid on the command line when reading results
@@ -301,7 +301,6 @@ def _band_grid(
                     _draw_band(ax, scenario_bands, line, color=color, scale=panel.scale)
                     _draw_historical(ax, reference, line, color=color, scale=panel.scale)
 
-            _mark_drain(ax, scenario, annotate=row == 0)
             if row == 0:
                 ax.set_title(f"demand level {level:g}x")
             if column == 0:
@@ -447,31 +446,3 @@ def _draw_bottleneck_mix(ax, scenario: pd.DataFrame, reference: pd.DataFrame) ->
             label=f"historical state-bound ({MIX_SMOOTHING_BLOCKS}-block mean)",
         )
 
-
-def _mark_drain(ax, scenario: pd.DataFrame, *, annotate: bool) -> None:
-    if scenario.empty or "is_drain_step" not in scenario.columns:
-        return
-    drain_positions = scenario.loc[
-        scenario["is_drain_step"].astype(bool), "simulation_position"
-    ]
-    if drain_positions.empty:
-        return
-    start = drain_positions.min()
-    ax.axvspan(
-        start,
-        scenario["simulation_position"].max(),
-        color="0.5",
-        alpha=0.15,
-        linewidth=0,
-        zorder=0,
-    )
-    if annotate:
-        ax.annotate(
-            "drain",
-            xy=(start, 1.0),
-            xycoords=("data", "axes fraction"),
-            xytext=(3, -10),
-            textcoords="offset points",
-            fontsize=7,
-            color="0.3",
-        )

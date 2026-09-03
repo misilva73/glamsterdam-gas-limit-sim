@@ -119,10 +119,9 @@ def build_cohorts(tx_frame: pd.DataFrame, headers: pd.DataFrame | None = None) -
         raise ValueError(f"tx_frame is missing required columns: {missing}")
 
     frame = tx_frame
-    # Which rows count as demand is entirely `split_simulatable`'s decision -- under
-    # the default `all` policy even failed transactions are real demand, since they
-    # still occupy block space and still pay. Re-filtering here would silently undo
-    # that choice, so this takes the frame as given.
+    # Every row is demand, failures included: they still occupy block space and
+    # still pay. There is no inclusion filter anywhere in the pipeline, so this
+    # takes the frame exactly as given.
     if frame.empty:
         raise ValueError("tx_frame contains no simulatable transactions")
 
@@ -431,9 +430,17 @@ def adapt_bids(arrivals: dict[str, np.ndarray], base_fee: int) -> dict[str, np.n
     # Clipped before the cast: a near-zero anchor makes the ratio large enough
     # that the product exceeds int64 even though the float64 product is fine.
     scaled = np.clip(np.rint(max_fee.astype(np.float64) * ratio), 0, _INT64_FLOAT_CAP)
-    shifted = max_fee + (int(base_fee) - anchor)
+    # Same float64-and-clip guard as `scaled`: the sum overflows int64 once the
+    # base fee and the cap are both large, which raised `OverflowError` here
+    # before `MAX_BASE_FEE` existed. The cap alone is not sufficient -- a fee cap
+    # already near int64 would still overflow the addition.
+    shifted = np.clip(
+        max_fee.astype(np.float64) + (float(base_fee) - anchor.astype(np.float64)),
+        0,
+        _INT64_FLOAT_CAP,
+    )
 
-    repriced = np.where(is_legacy, shifted, scaled.astype(np.int64))
+    repriced = np.where(is_legacy, shifted.astype(np.int64), scaled.astype(np.int64))
     return {
         **arrivals,
         "max_fee_per_gas": np.maximum(np.where(scalable, repriced, max_fee), 0).astype(np.int64),

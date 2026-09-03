@@ -15,6 +15,7 @@ from config import (
     ELASTICITY_MULTIPLIER,
     GAS_LIMIT_RAMP_DENOMINATOR,
     LEGACY_TX_TYPES,
+    MAX_BASE_FEE,
     MIN_BASE_FEE,
     SimConfig,
 )
@@ -61,20 +62,30 @@ def next_base_fee(parent_base_fee: int, parent_gas_used: int, parent_gas_limit: 
     The result is floored at `MIN_BASE_FEE`. Because the decrement is at most an
     eighth of the base fee itself, an emptying chain sticks at 7 wei or below on
     its own, so the floor binds only from a parent base fee of 0.
+
+    It is also capped at `MAX_BASE_FEE`, which the protocol does not do. A
+    scenario that cannot shed demand raises the fee ~12.5% per block without
+    limit and overflows int64 downstream; the cap turns that crash into a
+    scenario flagged by `base_fee_clamped`. It binds only in configurations whose
+    fees were already meaningless, never on a realistic path.
     """
     target = parent_gas_limit // ELASTICITY_MULTIPLIER
     if target <= 0 or parent_gas_used == target:
-        return max(MIN_BASE_FEE, parent_base_fee)
+        return _bounded_base_fee(parent_base_fee)
     if parent_gas_used > target:
         delta = parent_base_fee * (parent_gas_used - target)
-        return max(
-            MIN_BASE_FEE,
-            parent_base_fee + max(1, delta // target // BASE_FEE_MAX_CHANGE_DENOMINATOR),
+        return _bounded_base_fee(
+            parent_base_fee + max(1, delta // target // BASE_FEE_MAX_CHANGE_DENOMINATOR)
         )
     delta = parent_base_fee * (target - parent_gas_used)
-    return max(
-        MIN_BASE_FEE, parent_base_fee - delta // target // BASE_FEE_MAX_CHANGE_DENOMINATOR
+    return _bounded_base_fee(
+        parent_base_fee - delta // target // BASE_FEE_MAX_CHANGE_DENOMINATOR
     )
+
+
+def _bounded_base_fee(fee: int) -> int:
+    """Clamp one base-fee update into `[MIN_BASE_FEE, MAX_BASE_FEE]`."""
+    return min(MAX_BASE_FEE, max(MIN_BASE_FEE, fee))
 
 
 def realized_tip_per_gas(
@@ -140,15 +151,15 @@ def step_record(
     *,
     run_index: int,
     simulation_position: int,
-    is_drain_step: bool,
-    source_block_number: int | None,
-    window_instance: int | None,
-    position_in_window: int | None,
+    source_block_number: int,
+    window_instance: int,
+    position_in_window: int,
     demand_price_signal: float,
-    cohort_anchor_price: float | None,
-    realized_demand_multiplier: float | None,
+    cohort_anchor_price: float,
+    realized_demand_multiplier: float,
     demand_multiplier_clamped: bool,
     base_fee_per_gas: int,
+    base_fee_clamped: bool,
     gas_limit: int,
     block_execution_gas_used: int,
     block_state_gas_used: int,
@@ -168,7 +179,6 @@ def step_record(
         "demand_level": cfg.demand_level,
         "bootstrap_window_blocks": cfg.bootstrap_window_blocks,
         "simulation_position": simulation_position,
-        "is_drain_step": is_drain_step,
         "source_block_number": source_block_number,
         "window_instance": window_instance,
         "position_in_window": position_in_window,
@@ -177,6 +187,7 @@ def step_record(
         "realized_demand_multiplier": realized_demand_multiplier,
         "demand_multiplier_clamped": demand_multiplier_clamped,
         "base_fee_per_gas": base_fee_per_gas,
+        "base_fee_clamped": base_fee_clamped,
         "gas_limit": gas_limit,
         # Header-equivalent: the two dimensions share one limit, so the block's
         # gas used is the larger of them, and that is the EIP-1559 parent input.

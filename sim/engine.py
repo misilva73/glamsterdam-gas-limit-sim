@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from config import SimConfig
+from config import MAX_BASE_FEE, SimConfig
 from schemas import PER_STEP_COLUMNS
 from sim.metrics import (
     BACKLOG_COLUMNS,
@@ -53,7 +53,7 @@ TIP_TRANCHE_SIZE = 16_384
 # more time copying; higher ones spend more time scanning dead entries.
 COMPACTION_DEAD_SHARE = 0.25
 
-_NULLABLE_IDENTITY = ("source_block_number", "window_instance", "position_in_window")
+_IDENTITY_INTEGERS = ("source_block_number", "window_instance", "position_in_window")
 
 
 def run_path(
@@ -64,7 +64,12 @@ def run_path(
     run_index: int,
     starting_base_fee: int,
 ) -> pd.DataFrame:
-    """Simulate one arrival path plus its drain phase.
+    """Simulate one arrival path.
+
+    The run ends with the last arrival: whatever is still queued is simply
+    discarded. How fast a leftover backlog would clear is `backlog / gas_limit`
+    blocks of arithmetic, not a simulation result, and the backlog trajectory
+    during arrivals already says whether it is transient or structural.
 
     Every path in a scenario starts from the same state -- empty mempool,
     `starting_base_fee`, `cfg.fusaka_gas_limit`, and a price signal seeded at the
@@ -103,40 +108,33 @@ def run_path(
     prevailing_tip = _seed_tip(cohorts, cohort_index)
 
     records = []
-    for position in range(cohort_index.size + cfg.drain_blocks):
-        is_drain_step = position >= cohort_index.size
-
+    for position in range(cohort_index.size):
         # Both persistent-state updates are parent-derived, so position 0 reports
-        # the configured initial state verbatim. From then on the ramp applies at
-        # the configured step itself, with no activation delay.
+        # the configured initial state verbatim and the ramp first applies at
+        # position 1. Glamsterdam is always active from step 0.
         if parent_gas_used is not None:
             base_fee = next_base_fee(base_fee, parent_gas_used, gas_limit)
-            if position >= max(1, cfg.first_glamsterdam_simulation_step):
-                gas_limit = ramp_gas_limit(gas_limit, cfg.glamsterdam_gas_limit)
+            gas_limit = ramp_gas_limit(gas_limit, cfg.glamsterdam_gas_limit)
 
-        arrived_tx_count = arrived_execution_gas = arrived_state_gas = 0
-        cohort_anchor = multiplier = None
-        clamped = False
-        if not is_drain_step:
-            cohort_anchor = (
-                float(anchor_price[position]) if anchor_price is not None else float(base_fee)
-            )
-            multiplier, clamped = demand_multiplier(cfg, price_signal, cohort_anchor)
-            arrivals = sample_arrivals(
-                cohorts,
-                int(cohort_index[position]),
-                (int(pool_low[position]), int(pool_high[position])),
-                multiplier,
-                rng,
-            )
-            if cfg.adapt_bids:
-                arrivals = adapt_bids(arrivals, base_fee)
-            admit(pool, arrivals)
-            arrived_tx_count = int(arrivals["replica_index"].size)
-            arrived_execution_gas = int(arrivals["execution_gas"].sum())
-            arrived_state_gas = int(arrivals["state_gas"].sum())
-            backlog_execution_gas += arrived_execution_gas
-            backlog_state_gas += arrived_state_gas
+        cohort_anchor = (
+            float(anchor_price[position]) if anchor_price is not None else float(base_fee)
+        )
+        multiplier, clamped = demand_multiplier(cfg, price_signal, cohort_anchor)
+        arrivals = sample_arrivals(
+            cohorts,
+            int(cohort_index[position]),
+            (int(pool_low[position]), int(pool_high[position])),
+            multiplier,
+            rng,
+        )
+        if cfg.adapt_bids:
+            arrivals = adapt_bids(arrivals, base_fee)
+        admit(pool, arrivals)
+        arrived_tx_count = int(arrivals["replica_index"].size)
+        arrived_execution_gas = int(arrivals["execution_gas"].sum())
+        arrived_state_gas = int(arrivals["state_gas"].sum())
+        backlog_execution_gas += arrived_execution_gas
+        backlog_state_gas += arrived_state_gas
 
         chosen, block = fill_and_measure(
             pool, base_fee, gas_limit, backlog_execution_gas, backlog_state_gas
@@ -151,15 +149,15 @@ def run_path(
                 cfg,
                 run_index=run_index,
                 simulation_position=position,
-                is_drain_step=is_drain_step,
-                source_block_number=None if is_drain_step else int(source_block_number[position]),
-                window_instance=None if is_drain_step else int(window_instance[position]),
-                position_in_window=None if is_drain_step else int(position_in_window[position]),
+                source_block_number=int(source_block_number[position]),
+                window_instance=int(window_instance[position]),
+                position_in_window=int(position_in_window[position]),
                 demand_price_signal=price_signal,
                 cohort_anchor_price=cohort_anchor,
                 realized_demand_multiplier=multiplier,
                 demand_multiplier_clamped=clamped,
                 base_fee_per_gas=base_fee,
+                base_fee_clamped=base_fee >= MAX_BASE_FEE,
                 gas_limit=gas_limit,
                 included_tx_count=int(chosen.size),
                 arrived_tx_count=arrived_tx_count,
@@ -452,11 +450,12 @@ def fill_block(
 
 def _per_step_frame(records: list[dict]) -> pd.DataFrame:
     frame = pd.DataFrame.from_records(records, columns=list(PER_STEP_COLUMNS))
-    dtypes = {name: "Int64" for name in _NULLABLE_IDENTITY}
-    dtypes["is_drain_step"] = bool
+    # Every step now arrives a cohort, so the identity columns are always present
+    # and the demand columns are always drawn -- no nullable dtypes needed.
+    dtypes = {name: np.int64 for name in _IDENTITY_INTEGERS}
     dtypes["demand_multiplier_clamped"] = bool
+    dtypes["base_fee_clamped"] = bool
     dtypes["priority_fees_wei"] = "float64"  # can exceed int64; see _priority_fees_wei
-    # NaN on drain steps, where no cohort arrives and so no multiplier is drawn.
     dtypes["cohort_anchor_price"] = "float64"
     dtypes["realized_demand_multiplier"] = "float64"
     dtypes["demand_price_signal"] = "float64"
