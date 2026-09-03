@@ -90,13 +90,13 @@ in its `manifest.json`.
 | `--no-bid-adaptation` | Freeze historical fee caps instead of repricing them from their own block's base fee to the simulated one. Makes the fee filter, not the elasticity, set how much demand is eligible. | off |
 
 **Simulation grid** — every combination of the three axes is a scenario, each run
-`--num-runs` times. The two demand axes multiply, so the defaults are 36 cells;
+`--num-runs` times. The two demand axes multiply, so the defaults are 27 cells;
 narrow them explicitly on a long trace.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--elasticities E [E ...]` | Demand-*shape* axis: aggregate price elasticity. `0` is a flat multiplier with no price response, and is no longer swept by default: with bid adaptation on it cannot shed demand above `--demand-levels 1`, so the base fee runs to the `MAX_BASE_FEE` ceiling and `base_fee_clamped_share` goes non-zero. | `0.10 0.175 0.28` |
-| `--demand-levels A [A ...]` | Demand-*level* axis: latent-demand multiplier at the anchor price, standing in for never-included and secular-growth demand. | `1 1.5 2 3` |
+| `--demand-levels A [A ...]` | Demand-*level* axis: latent-demand multiplier at the anchor price, standing in for never-included and secular-growth demand. | `1 1.5 2` |
 | `--window-blocks L [L ...]` | Bootstrap axis: length in cohorts of each resampled window. | `16 32 64` |
 | `--no-historical` | Skip the historical reference path (bands only). | off |
 | `--output-dir PATH` | Destination for every file below. | `output/` |
