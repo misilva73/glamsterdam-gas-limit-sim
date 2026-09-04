@@ -1,7 +1,5 @@
 pandas
 numpy
-scipy
-statsmodels
 pyarrow
 clickhouse-connect
 pytest

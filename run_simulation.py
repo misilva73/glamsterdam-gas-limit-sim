@@ -30,7 +30,6 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from analysis.window_length import cohort_summary, suggest_window_blocks
 from config import DEFAULT_CONFIG, SimConfig, SimulationGrid
 from data.fetch_blocks import fetch_block_headers, starting_base_fee
 from data.load_tx_gas_results import (
@@ -58,8 +57,6 @@ CAVEAT = (
 REPORTED_LIBRARIES = (
     "pandas",
     "numpy",
-    "scipy",
-    "statsmodels",
     "pyarrow",
 )
 
@@ -250,7 +247,6 @@ class SimulationResult(NamedTuple):
     per_step: pd.DataFrame
     outcomes: pd.DataFrame
     summary: pd.DataFrame
-    window_length: pd.DataFrame
     manifest: dict
     outputs: list[Path]
 
@@ -269,10 +265,6 @@ def run_simulation(cfg: SimConfig, grid: SimulationGrid) -> SimulationResult:
         headers = fetch_headers(cfg, simulatable)
         cohorts = build_cohorts(simulatable, headers)
         base_fee = resolve_starting_base_fee(cfg, headers, simulatable)
-        cohorts_by_block = cohort_summary(simulatable)
-        window_length = suggest_window_blocks(
-            cohorts_by_block, candidates=grid.bootstrap_window_blocks
-        )
 
     horizon = cfg.simulation_horizon_blocks or len(cohorts)
 
@@ -300,14 +292,14 @@ def run_simulation(cfg: SimConfig, grid: SimulationGrid) -> SimulationResult:
 
     summary = scenario_summary(per_step)
     with _timed(timings, "write_seconds"):
-        outputs = write_outputs(cfg, per_step, outcomes, summary, window_length)
+        outputs = write_outputs(cfg, per_step, outcomes, summary)
 
     timings["total_seconds"] = time.perf_counter() - started
-    manifest = run_manifest(cfg, grid, horizon, base_fee, window_length, timings, outputs)
+    manifest = run_manifest(cfg, grid, horizon, base_fee, timings, outputs)
     manifest_path = Path(cfg.output_dir) / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
     return SimulationResult(
-        per_step, outcomes, summary, window_length, manifest, outputs + [manifest_path]
+        per_step, outcomes, summary, manifest, outputs + [manifest_path]
     )
 
 
@@ -439,7 +431,6 @@ def write_outputs(
     per_step: pd.DataFrame,
     outcomes: pd.DataFrame,
     summary: pd.DataFrame,
-    window_length: pd.DataFrame,
 ) -> list[Path]:
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -454,9 +445,7 @@ def write_outputs(
     outcomes.to_csv(outcomes_path)
     summary_path = out_dir / "scenario_summary.csv"
     summary.to_csv(summary_path, index=False)
-    window_path = out_dir / "window_length.csv"
-    window_length.to_csv(window_path, index=False)
-    return paths + [outcomes_path, summary_path, window_path]
+    return paths + [outcomes_path, summary_path]
 
 
 def run_manifest(
@@ -464,7 +453,6 @@ def run_manifest(
     grid: SimulationGrid,
     horizon: int,
     base_fee: int,
-    window_length: pd.DataFrame,
     timings: dict[str, float],
     outputs: list[Path],
 ) -> dict:
@@ -477,7 +465,6 @@ def run_manifest(
             "bootstrap_seed": cfg.bootstrap_seed,
             "demand_seed": cfg.demand_seed,
         },
-        "window_length_diagnostics": window_length.to_dict(orient="records"),
         "library_versions": library_versions(),
         "timings": {k: round(v, 3) for k, v in timings.items()},
         "outputs": [str(p) for p in outputs],
@@ -503,8 +490,6 @@ def main(argv: list[str] | None = None) -> int:
         if not result.outcomes.empty
         else "empty trace: no replay rows in range"
     )
-    print(_banner("BOOTSTRAP BLOCK LENGTH (L) SUPPORTED BY COHORT AUTOCORRELATION"))
-    print(result.window_length.to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
     print(_banner("SCENARIO SUMMARY"))
     print(result.summary.to_string(index=False, float_format=lambda v: f"{v:,.3f}"))
     print(f"\n{CAVEAT}\n")

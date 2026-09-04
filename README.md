@@ -117,8 +117,6 @@ Written to `--output-dir`. Every column is documented in `METHODOLOGY.md` §8.
 - `replay_outcome_summary.csv` — the whole trace broken down by how each row fared
   in the replay. Nothing is excluded; this reports what is being simulated, and in
   particular how much state gas sits in gas-rescuable rows.
-- `window_length.csv` — the autocorrelation argument for the bootstrap block
-  length `L`.
 - `manifest.json` — resolved config, grid, seeds, library versions, timings.
 
 ## Read this before quoting any number

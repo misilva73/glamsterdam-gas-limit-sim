@@ -280,17 +280,18 @@ not as part of the bootstrap bands.
 
 ### 5.3 Choosing the bootstrap length `L`
 
-`analysis/window_length.py` summarizes each cohort by transaction count, both gas
-dimensions, and fee statistics. For every series it reports:
+`L` must be long enough to carry the dependence that matters -- congestion persists
+across blocks, so cohort size, gas mix, and fee level are all autocorrelated -- and
+short enough that resampling still produces genuinely new paths.
 
-- first autocorrelation lag below `1/e`;
-- first lag inside the approximate 95% white-noise band;
-- integral timescale through the first non-positive autocorrelation.
+**`L` is not estimated; it is swept.** The grid runs every candidate (16, 32, 64 by
+default) and the answer is judged by whether conclusions move across them. A
+conclusion that holds at all three does not depend on the choice; one that does not
+is a finding about `L`, not about the gas limit.
 
-The most conservative estimate is `decorrelation_blocks`.
-`supported_window_blocks` is the smallest candidate `L` that covers it, or null if
-none does. `window_length.csv` records the evidence.
-Treat `L` as a robustness axis and re-estimate it for each real trace.
+An earlier version reported an autocorrelation-based suggestion per run. It was
+dropped: it never fed the simulation, it recomputed an identical answer once per
+grid cell, and sweeping `L` answers the same question more directly.
 
 ## 6. Demand model
 
@@ -546,7 +547,6 @@ Units are wei and gas unless a name states otherwise. `priority_fees_wei` is
 ### 8.3 Other artifacts
 
 - `replay_outcome_summary.csv`: the whole trace broken down by replay outcome (§4.1). Nothing is excluded; this reports what is being simulated.
-- `window_length.csv`: autocorrelation evidence for bootstrap `L`.
 - `manifest.json`: resolved config and grid, seeds, source range, initial base fee,
   library versions, timings, output paths, and the standing caveat.
 
@@ -603,7 +603,7 @@ State these whenever reporting results from this repository.
   the base fee runs to `MAX_BASE_FEE` (§7.2). It remains available as a
   single-scenario setting, where `demand_level <= 1` keeps it meaningful.
 - `L` changes which dependence structure the bootstrap preserves. If conclusions
-  change across `L`, consult `window_length.csv`.
+  change across `L`, the dependence structure is doing the work, not the gas limit.
 - The historical line shows the original cohort ordering under simulated rules.
   It is a reference path, not observed historical outcomes and not a confidence
   interval.

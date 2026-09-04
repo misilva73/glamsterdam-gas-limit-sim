@@ -1,4 +1,4 @@
-"""Tests for the window-length diagnostic and the simulation plumbing.
+"""Tests for the simulation entry point: CLI, summaries, and the output contract.
 
 The engine and the workload model are exercised elsewhere; here everything is
 driven from a synthetic per-step frame with exactly `schemas.PER_STEP_COLUMNS`,
@@ -15,12 +15,6 @@ import pytest
 
 import run_simulation
 import schemas
-from analysis.window_length import (
-    SUMMARY_SERIES,
-    autocorrelation,
-    cohort_summary,
-    suggest_window_blocks,
-)
 from config import DEFAULT_CONFIG
 from sim.workload import bootstrap_path, bootstrap_rng, build_cohorts
 from tests.dummy import (
@@ -126,68 +120,14 @@ def test_synthetic_frame_matches_the_contract():
     assert list(frame.columns) == list(schemas.PER_STEP_COLUMNS)
 
 
-# --- autocorrelation and window length --------------------------------------
-
-
-def ar1(phi: float, n: int = 4000, seed: int = 3) -> pd.Series:
-    rng = np.random.default_rng(seed)
-    shocks = rng.normal(size=n)
-    values = np.empty(n)
-    values[0] = shocks[0]
-    for i in range(1, n):
-        values[i] = phi * values[i - 1] + shocks[i]
-    return pd.Series(values, name="tx_count")
-
-
-def test_autocorrelation_tracks_the_ar1_decay():
-    correlations = autocorrelation(ar1(0.9), nlags=60)
-
-    assert correlations.index.name == "lag"
-    assert correlations.iloc[0] == pytest.approx(1.0)
-    assert correlations[1] == pytest.approx(0.9, abs=0.05)
-    assert correlations[5] == pytest.approx(0.9**5, abs=0.08)
-
-
-def test_autocorrelation_clips_nlags_to_the_series_length():
-    assert len(autocorrelation(pd.Series([1.0, 2.0, 3.0, 4.0]), nlags=100)) == 4
-
-
-def test_suggest_window_blocks_recovers_the_ar1_timescale():
-    # rho_k = 0.9^k crosses 1/e near lag 10; integral timescale is ~19 blocks.
-    suggestion = suggest_window_blocks(pd.DataFrame({"tx_count": ar1(0.9)})).iloc[0]
-
-    assert 6 <= suggestion["lag_below_1_over_e"] <= 16
-    assert 10 <= suggestion["integral_timescale_blocks"] <= 40
-    assert suggestion["supported_window_blocks"] in (32.0, 64.0)
-
-
-def test_suggest_window_blocks_on_white_noise_supports_the_shortest_candidate():
-    noise = pd.DataFrame({"tx_count": np.random.default_rng(1).normal(size=3000)})
-    suggestion = suggest_window_blocks(noise).iloc[0]
-
-    assert suggestion["lag_below_1_over_e"] == 1.0
-    assert suggestion["lag_inside_white_noise_band"] == 1.0
-    assert suggestion["integral_timescale_blocks"] == pytest.approx(1.0, abs=0.3)
-    assert suggestion["supported_window_blocks"] == 16.0
-
-
-def test_suggest_window_blocks_reports_when_no_candidate_is_long_enough():
-    slow = pd.DataFrame({"tx_count": ar1(0.995, n=6000)})
-    suggestion = suggest_window_blocks(slow, candidates=(2, 4)).iloc[0]
-    assert np.isnan(suggestion["supported_window_blocks"])
-
-
-def test_suggest_window_blocks_covers_every_summary_series():
-    summary = cohort_summary(dummy_cohorts())
-    suggestion = suggest_window_blocks(summary, nlags=80)
-    assert list(suggestion["series"]) == list(SUMMARY_SERIES)
-
-
-# --- cohort_summary ---------------------------------------------------------
+# --- cohort fixtures --------------------------------------------------------
 
 
 def dummy_cohorts(num_blocks: int = 200) -> pd.DataFrame:
-    """Dummy replay rows with the gas dimensions derived here, not imported."""
+    """Dummy replay rows with the gas dimensions derived here, not imported.
+
+    Every row is kept: there is no inclusion policy, so failures are demand too.
+    """
     frame = dummy_tx_gas_results(num_blocks=num_blocks)
     return frame.assign(
         state_gas=frame["schedule_state_gas_spent"],
@@ -198,43 +138,10 @@ def dummy_cohorts(num_blocks: int = 200) -> pd.DataFrame:
     )
 
 
-def simulatable_cohorts(num_blocks: int = 200) -> pd.DataFrame:
-    """Row selection is the loader's job; `build_cohorts` rejects an unsplit frame."""
-    frame = dummy_cohorts(num_blocks)
-    return frame[(frame["baseline_success"] == 1) & (frame["schedule_success"] == 1)]
-
-
 def anchored_cohorts(num_blocks: int = 200):
     """Cohorts with demand anchors, as `run_simulation` builds them."""
     frame = dummy_cohorts(num_blocks)
-    return build_cohorts(simulatable_cohorts(num_blocks), dummy_block_headers(frame))
-
-
-def test_cohort_summary_is_one_row_per_source_block():
-    tx_frame = dummy_cohorts(num_blocks=50)
-    summary = cohort_summary(tx_frame)
-
-    assert list(summary.columns) == list(SUMMARY_SERIES)
-    assert summary.index.name == "block_number"
-    assert len(summary) == tx_frame["block_number"].nunique()
-    assert summary.index.is_monotonic_increasing
-    assert summary["tx_count"].sum() == len(tx_frame)
-
-
-def test_cohort_summary_totals_match_a_manual_groupby():
-    tx_frame = dummy_cohorts(num_blocks=20)
-    summary = cohort_summary(tx_frame)
-    block = tx_frame["block_number"].iloc[0]
-    cohort = tx_frame[tx_frame["block_number"] == block]
-
-    assert summary.loc[block, "execution_gas"] == cohort["execution_gas"].sum()
-    assert summary.loc[block, "state_gas"] == cohort["state_gas"].sum()
-    assert summary.loc[block, "median_max_fee_per_gas"] == cohort["max_fee_per_gas"].median()
-
-
-def test_dummy_cohorts_are_autocorrelated_enough_to_need_a_window():
-    summary = cohort_summary(dummy_cohorts(num_blocks=400))
-    assert autocorrelation(summary["tx_count"], nlags=10)[1] > 0.5
+    return build_cohorts(frame, dummy_block_headers(frame))
 
 
 # --- CLI and simulation plumbing --------------------------------------------
@@ -350,7 +257,7 @@ def test_the_analysis_config_hash_is_mandatory_on_the_command_line():
 
 
 def test_bootstrap_paths_are_reproducible_and_independent_across_runs():
-    cohorts = build_cohorts(simulatable_cohorts(num_blocks=80))
+    cohorts = build_cohorts(dummy_cohorts(num_blocks=80))
     cfg = run_simulation.build_config(parse(["--seed", "5"]))
     path = lambda c, run: bootstrap_path(
         cohorts, 40, c.bootstrap_window_blocks, bootstrap_rng(c, run)
@@ -424,7 +331,6 @@ def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
         "per_step.parquet",
         "replay_outcome_summary.csv",
         "scenario_summary.csv",
-        "window_length.csv",
         "manifest.json",
     }
     assert not any(p.suffix == ".png" for p in result.outputs)

@@ -38,12 +38,10 @@ sim/engine.py                 the per-block loop: fee update, gas-limit ramp, de
                               draw, block fill, price-signal update
 sim/metrics.py                pure protocol functions + per-step record assembly
 
-analysis/window_length.py     cohort summaries, autocorrelation, choice of bootstrap L
-analysis/bands.py             collapse bootstrap runs into per-position bands
-run_simulation.py             CLI: load → simulate the grid → write output → plot
+run_simulation.py             CLI: load → simulate the grid → write output
 tests/dummy.py                synthetic replay rows + headers (test fixtures only)
 tests/conftest.py             `offline_data`, which injects them at the fetch seams
-tests/                        pytest suite (166 tests)
+tests/                        pytest suite
 ```
 
 `schemas.py` is the contract between layers. Changing an existing name there is a
@@ -279,12 +277,12 @@ implementations, and compaction cadence is asserted not to change output.
 ## Conventions
 
 - Python 3.12, pandas 3.x (copy-on-write default — no chained assignment, no
-  `inplace=`), numpy, scipy, statsmodels. matplotlib/seaborn are notebook-only:
-  a simulation run draws nothing.
+  `inplace=`), numpy. matplotlib/seaborn are notebook-only: a simulation run
+  draws nothing and depends on neither.
 - Flat layout, plain functions, dataclasses for config. No class hierarchies,
   registries, or dependency injection.
 - Comments explain protocol subtleties, dataset caveats, and *why* — not what the
   code already says.
-- Prefer library primitives (pandas groupby/quantile, statsmodels `acf`) over
+- Prefer library primitives (pandas groupby/quantile) over
   hand-rolled equivalents. Custom code is for the project-specific parts: the
   block-fill rule, the gas-limit ramp, and two-dimensional capacity accounting.
