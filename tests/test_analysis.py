@@ -15,20 +15,11 @@ import pytest
 
 import run_simulation
 import schemas
-from analysis.plots import (
-    aggregate_bands,
-    plot_backlog,
-    plot_base_fee,
-    plot_demand_response,
-    plot_gas_limit_ramp,
-    plot_simulation,
-    plot_utilization,
-)
+from analysis.bands import aggregate_bands
 from analysis.window_length import (
     SUMMARY_SERIES,
     autocorrelation,
     cohort_summary,
-    plot_autocorrelation,
     suggest_window_blocks,
 )
 from config import DEFAULT_CONFIG
@@ -41,15 +32,6 @@ from tests.dummy import (
 
 BOOTSTRAP = "moving_block_bootstrap"
 HISTORICAL = "historical"
-
-PLOT_FUNCTIONS = (
-    plot_base_fee,
-    plot_utilization,
-    plot_gas_limit_ramp,
-    plot_backlog,
-    plot_demand_response,
-)
-
 
 # --- synthetic per-step frames ----------------------------------------------
 
@@ -328,62 +310,6 @@ def test_dummy_cohorts_are_autocorrelated_enough_to_need_a_window():
     assert autocorrelation(summary["tx_count"], nlags=10)[1] > 0.5
 
 
-# --- figures ----------------------------------------------------------------
-
-
-def assert_png(path):
-    assert path.exists(), path
-    assert path.stat().st_size > 5_000, f"{path} looks empty ({path.stat().st_size} bytes)"
-
-
-@pytest.mark.parametrize("plot", PLOT_FUNCTIONS, ids=lambda f: f.__name__)
-def test_plot_writes_a_png_for_a_single_scenario(plot, tmp_path):
-    bootstrap = synthetic_per_step()
-    historical = synthetic_per_step(num_runs=1, arrival_mode=HISTORICAL, seed=9)
-    assert_png(plot(bootstrap, historical, tmp_path / f"{plot.__name__}.png"))
-
-
-@pytest.mark.parametrize("plot", PLOT_FUNCTIONS, ids=lambda f: f.__name__)
-def test_plot_writes_a_png_for_the_full_grid(plot, tmp_path):
-    grid = dict(elasticities=(0.0, 0.175), levels=(1.0, 2.0), windows=(16, 64), positions=30)
-    bootstrap = synthetic_per_step(**grid)
-    historical = synthetic_per_step(
-        num_runs=1, arrival_mode=HISTORICAL, seed=9, **grid
-    )
-    assert_png(plot(bootstrap, historical, tmp_path / f"{plot.__name__}_grid.png"))
-
-
-@pytest.mark.parametrize("plot", PLOT_FUNCTIONS, ids=lambda f: f.__name__)
-def test_plot_survives_a_missing_historical_reference(plot, tmp_path):
-    bootstrap = synthetic_per_step()
-    empty = bootstrap.iloc[:0]
-    assert_png(plot(bootstrap, empty, tmp_path / f"{plot.__name__}_bands_only.png"))
-
-
-def test_plot_simulation_writes_every_figure(tmp_path):
-    bootstrap = synthetic_per_step(levels=(1.0, 2.0))
-    historical = synthetic_per_step(
-        levels=(1.0, 2.0), num_runs=1, arrival_mode=HISTORICAL
-    )
-    paths = plot_simulation(bootstrap, historical, tmp_path / "figures")
-
-    assert len(paths) == len(PLOT_FUNCTIONS)
-    assert {p.name for p in paths} == {
-        "base_fee.png",
-        "utilization.png",
-        "gas_limit_ramp.png",
-        "backlog.png",
-        "demand_response.png",
-    }
-    for path in paths:
-        assert_png(path)
-
-
-def test_plot_autocorrelation_writes_a_png(tmp_path):
-    summary = cohort_summary(dummy_cohorts(num_blocks=300))
-    assert_png(plot_autocorrelation(summary, 120, tmp_path / "acf.png"))
-
-
 # --- CLI and simulation plumbing --------------------------------------------
 
 
@@ -564,18 +490,17 @@ def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
     }
     assert len(result.summary) == 4  # arrival modes x elasticities
 
+    # Data only: the per-step frame is parquet, the summaries are small CSVs, and
+    # a run writes no figures and no CSV copy of the per-step frame.
     written = {path.name for path in result.outputs}
-    assert {
-        "per_step.csv",
+    assert written == {
         "per_step.parquet",
         "replay_outcome_summary.csv",
         "scenario_summary.csv",
+        "window_length.csv",
         "manifest.json",
-        "base_fee.png",
-        "utilization.png",
-        "gas_limit_ramp.png",
-        "backlog.png",
-    } <= written
+    }
+    assert not any(p.suffix == ".png" for p in result.outputs)
     for path in result.outputs:
         assert path.stat().st_size > 0
 

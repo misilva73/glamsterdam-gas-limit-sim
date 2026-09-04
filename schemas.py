@@ -1,4 +1,4 @@
-"""Column contracts shared by the loaders, the engine, and the plots.
+"""Column contracts shared by the loaders, the engine, and downstream analysis.
 
 Keeping these in one place lets the data layer, the simulator, and the analysis
 layer be developed and tested against the same frame shapes -- including against

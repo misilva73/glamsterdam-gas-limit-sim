@@ -12,16 +12,11 @@ white-noise band, and the integral timescale, then say which of the candidate
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.stattools import acf
-
-from analysis.plots import FIGURE_DPI, use_style  # also pins the Agg backend
-
-import matplotlib.pyplot as plt
 
 DECAY_THRESHOLD = 1.0 / np.e
 WHITE_NOISE_Z = 1.96
@@ -92,47 +87,6 @@ def suggest_window_blocks(
             }
         )
     return pd.DataFrame(rows)
-
-
-def plot_autocorrelation(
-    summary: pd.DataFrame,
-    nlags: int,
-    out_path: Path,
-    candidates: Sequence[int] = (16, 32, 64),
-) -> Path:
-    """ACF of every cohort summary series, with the candidate `L` values marked."""
-    use_style()
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    band = WHITE_NOISE_Z / np.sqrt(len(summary))
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for name in summary.columns:
-        correlations = autocorrelation(summary[name], nlags)
-        ax.plot(correlations.index, correlations.to_numpy(), lw=1.3, label=name)
-
-    ax.axhspan(-band, band, color="0.5", alpha=0.15, linewidth=0, label="95% white-noise band")
-    ax.axhline(DECAY_THRESHOLD, color="0.3", lw=0.8, ls=":", label="1/e")
-    for candidate in candidates:
-        ax.axvline(candidate, color="0.4", lw=0.8, ls="--")
-        ax.annotate(
-            f"L={candidate}",
-            xy=(candidate, 1.0),
-            xycoords=("data", "axes fraction"),
-            xytext=(2, -10),
-            textcoords="offset points",
-            fontsize=7,
-            color="0.3",
-        )
-
-    ax.set_xlabel("lag (blocks)")
-    ax.set_ylabel("autocorrelation")
-    ax.set_title("Cohort autocorrelation and candidate bootstrap block lengths")
-    ax.legend(fontsize=7)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=FIGURE_DPI)
-    plt.close(fig)
-    return out_path
 
 
 def _first_lag_below(correlations: pd.Series, threshold: float) -> float:

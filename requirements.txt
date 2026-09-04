@@ -2,8 +2,11 @@ pandas
 numpy
 scipy
 statsmodels
-matplotlib
-seaborn
 pyarrow
 clickhouse-connect
 pytest
+
+# Analysis only. A simulation run draws nothing, so a machine that only runs the
+# sweep does not need these -- they are here for `notebooks/`.
+matplotlib
+seaborn

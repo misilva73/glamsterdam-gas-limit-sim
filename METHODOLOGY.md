@@ -86,7 +86,7 @@ construct a historical or bootstrap arrival path
                   ↓
 simulate demand, mempool, block fill, gas limit, and base fee
                   ↓
-write per-step data, scenario summaries, manifest, and figures
+write per-step data, scenario summaries, and manifest
 ```
 
 The upstream replay determines per-transaction gas and success under the candidate
@@ -289,7 +289,7 @@ dimensions, and fee statistics. For every series it reports:
 
 The most conservative estimate is `decorrelation_blocks`.
 `supported_window_blocks` is the smallest candidate `L` that covers it, or null if
-none does. `window_length.csv` and `cohort_autocorrelation.png` record the evidence.
+none does. `window_length.csv` records the evidence.
 Treat `L` as a robustness axis and re-estimate it for each real trace.
 
 ## 6. Demand model
@@ -515,8 +515,11 @@ All files are written under `output_dir`.
 
 ### 8.1 Per-step data
 
-`per_step.csv` and `per_step.parquet` contain one row per simulated block and use
-the exact order in `schemas.PER_STEP_COLUMNS`.
+`per_step.parquet` contains one row per simulated block and uses the exact order
+in `schemas.PER_STEP_COLUMNS`. Parquet only: a CSV copy of the same frame is
+~3.5x the bytes, ~11x slower to write, and lossy on reload, so it cost wall clock
+while being the worse copy. The small summaries stay CSV because they are meant
+to be read directly.
 
 | Group | Columns |
 | --- | --- |
@@ -546,11 +549,11 @@ Units are wei and gas unless a name states otherwise. `priority_fees_wei` is
 - `window_length.csv`: autocorrelation evidence for bootstrap `L`.
 - `manifest.json`: resolved config and grid, seeds, source range, initial base fee,
   library versions, timings, output paths, and the standing caveat.
-- `figures/`: base fee, utilisation, ramp, backlog, demand response, and cohort
-  autocorrelation.
 
-Bootstrap figures show p10–p90 bands, min/max whiskers, and a median. The historical
-path is a separate dashed reference; it is never included in bootstrap bands.
+A run writes data and nothing else -- no figures, no analysis. Reading the results
+belongs in `notebooks/`, where `analysis.bands.aggregate_bands` collapses the
+bootstrap runs into per-position p10-p90 bands. The historical path is a separate
+reference and is never folded into those bands.
 
 ## 9. Assumptions
 

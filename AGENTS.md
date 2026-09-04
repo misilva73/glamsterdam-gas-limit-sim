@@ -39,7 +39,7 @@ sim/engine.py                 the per-block loop: fee update, gas-limit ramp, de
 sim/metrics.py                pure protocol functions + per-step record assembly
 
 analysis/window_length.py     cohort summaries, autocorrelation, choice of bootstrap L
-analysis/plots.py             quantile bands + historical overlay figures
+analysis/bands.py             collapse bootstrap runs into per-position bands
 run_simulation.py             CLI: load → simulate the grid → write output → plot
 tests/dummy.py                synthetic replay rows + headers (test fixtures only)
 tests/conftest.py             `offline_data`, which injects them at the fetch seams
@@ -279,7 +279,8 @@ implementations, and compaction cadence is asserted not to change output.
 ## Conventions
 
 - Python 3.12, pandas 3.x (copy-on-write default — no chained assignment, no
-  `inplace=`), numpy, scipy, statsmodels, matplotlib/seaborn.
+  `inplace=`), numpy, scipy, statsmodels. matplotlib/seaborn are notebook-only:
+  a simulation run draws nothing.
 - Flat layout, plain functions, dataclasses for config. No class hierarchies,
   registries, or dependency injection.
 - Comments explain protocol subtleties, dataset caveats, and *why* — not what the

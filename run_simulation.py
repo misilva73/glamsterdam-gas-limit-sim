@@ -3,8 +3,11 @@
 
 Sweeps the elasticity x demand-level x bootstrap-window grid, runs
 `num_bootstrap_runs` independent moving-block-bootstrap paths plus one matching
-historical reference path per cell, writes the per-step frame, a run manifest,
-and the simulation figures.
+historical reference path per cell, and writes the per-step frame, the scenario
+summaries, and a run manifest.
+
+It does no analysis and draws no figures. The job here is to produce data;
+reading it belongs in `notebooks/`.
 
 Every path in a scenario starts from the identical initial state: empty mempool,
 the base fee of the actual parent of `reference_start_block`, and
@@ -27,12 +30,7 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from analysis.plots import plot_simulation
-from analysis.window_length import (
-    cohort_summary,
-    plot_autocorrelation,
-    suggest_window_blocks,
-)
+from analysis.window_length import cohort_summary, suggest_window_blocks
 from config import DEFAULT_CONFIG, SimConfig, SimulationGrid
 from data.fetch_blocks import fetch_block_headers, starting_base_fee
 from data.load_tx_gas_results import (
@@ -49,9 +47,6 @@ HISTORICAL_MODE = "historical"
 SATURATION_THRESHOLD = 0.99
 """Utilization at or above which a block counts as saturated in a dimension."""
 
-ACF_LAGS = 200
-"""Lag horizon for the cohort autocorrelation that argues the bootstrap `L`."""
-
 CAVEAT = (
     "Frozen-trace simulation: repriced gas and success are fixed, and demand is an "
     "isoelastic model fitted to daily aggregates, extrapolated well outside its "
@@ -65,8 +60,6 @@ REPORTED_LIBRARIES = (
     "numpy",
     "scipy",
     "statsmodels",
-    "matplotlib",
-    "seaborn",
     "pyarrow",
 )
 
@@ -183,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="A",
         help="demand-level axis: latent-demand multiplier at the anchor price, "
         "standing in for never-included and secular-growth demand "
-        "(default: 1 1.5 2 3)",
+        "(default: 1 1.5 2)",
     )
     grid.add_argument(
         "--window-blocks",
@@ -306,25 +299,8 @@ def run_simulation(cfg: SimConfig, grid: SimulationGrid) -> SimulationResult:
         )
 
     summary = scenario_summary(per_step)
-    figure_dir = Path(cfg.output_dir) / "figures"
     with _timed(timings, "write_seconds"):
         outputs = write_outputs(cfg, per_step, outcomes, summary, window_length)
-    with _timed(timings, "plot_seconds"):
-        bands, reference = (
-            per_step[per_step["arrival_mode"] == BOOTSTRAP_MODE],
-            per_step[per_step["arrival_mode"] == HISTORICAL_MODE],
-        )
-        if bands.empty:  # historical-only simulation: the reference is the whole story
-            bands, reference = reference, bands
-        outputs += plot_simulation(bands, reference, figure_dir)
-        outputs.append(
-            plot_autocorrelation(
-                cohorts_by_block,
-                ACF_LAGS,
-                figure_dir / "cohort_autocorrelation.png",
-                candidates=grid.bootstrap_window_blocks,
-            )
-        )
 
     timings["total_seconds"] = time.perf_counter() - started
     manifest = run_manifest(cfg, grid, horizon, base_fee, window_length, timings, outputs)
@@ -467,9 +443,12 @@ def write_outputs(
 ) -> list[Path]:
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths = [out_dir / "per_step.csv", out_dir / "per_step.parquet"]
-    per_step.to_csv(paths[0], index=False)
-    per_step.to_parquet(paths[1], index=False)
+    # Parquet only. A CSV copy of the same frame is ~3.5x the bytes, ~11x slower
+    # to write, and lossy on reload (bools become strings, the Int64/int64
+    # distinction goes), so it cost real wall clock while being the worse copy.
+    # The small summaries below stay CSV because they are meant to be read.
+    paths = [out_dir / "per_step.parquet"]
+    per_step.to_parquet(paths[0], index=False)
 
     outcomes_path = out_dir / "replay_outcome_summary.csv"
     outcomes.to_csv(outcomes_path)

@@ -105,7 +105,7 @@ narrow them explicitly on a long trace.
 
 Written to `--output-dir`. Every column is documented in `METHODOLOGY.md` §8.
 
-- `per_step.csv` / `.parquet` — one row per simulated block: base fee, gas limit,
+- `per_step.parquet` — one row per simulated block: base fee, gas limit,
   header-equivalent gas used, execution/state gas and utilisation, bottleneck
   dimension, included transactions, sender-facing gas, priority fees, arrivals by
   dimension, eligible / fee-ineligible backlog by count and both gas dimensions,
@@ -120,9 +120,6 @@ Written to `--output-dir`. Every column is documented in `METHODOLOGY.md` §8.
 - `window_length.csv` — the autocorrelation argument for the bootstrap block
   length `L`.
 - `manifest.json` — resolved config, grid, seeds, library versions, timings.
-- `figures/` — base fee, utilisation by dimension, gas-limit ramp, mempool
-  backlog, demand response, and the cohort autocorrelation, each as a bootstrap
-  p10–p90 band with the historical path overlaid.
 
 ## Read this before quoting any number
 
