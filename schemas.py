@@ -56,48 +56,15 @@ BLOCK_HEADER_COLUMNS = (
     "base_fee_per_gas",
 )
 
-# --- Workload items fed to the engine --------------------------------------------
-# One row per (source transaction x demand replica), tagged with its arrival step.
-
-WORKLOAD_COLUMNS = (
-    "arrival_step",
-    "window_instance",
-    "source_block_number",
-    "tx_index",
-    "tx_hash",
-    "replica_index",
-    "tx_type",
-    "max_fee_per_gas",
-    "max_priority_fee_per_gas",
-    "execution_gas",
-    "state_gas",
-    "schedule_gas_used",
-    # Base fee of the item's own source block: what the bid rescale prices from.
-    "anchor_base_fee",
-)
-
-# Deterministic inclusion order after the tip-descending sort. Documented here
-# because reproducibility of a run depends on this exact tie-break chain.
-INCLUSION_TIEBREAK_COLUMNS = (
-    "arrival_step",
-    "window_instance",
-    "source_block_number",
-    "tx_index",
-    "replica_index",
-)
-
 # --- Per-step simulation output ---------------------------------------------------
 
 PER_STEP_IDENTITY_COLUMNS = (
-    "arrival_mode",
     "run_index",
     "aggregate_elasticity",
     "demand_level",
     "bootstrap_window_blocks",
     "simulation_position",
     "source_block_number",
-    "window_instance",
-    "position_in_window",
 )
 
 # The demand axes are scenario-level (identity); the multiplier they produce is a
@@ -117,12 +84,8 @@ PER_STEP_METRIC_COLUMNS = (
     # this value, so any scenario with a non-zero share has uninterpretable fees.
     "base_fee_clamped",
     "gas_limit",
-    "gas_used",
     "block_execution_gas_used",
     "block_state_gas_used",
-    "execution_utilization",
-    "state_utilization",
-    "bottleneck_dimension",
     "included_tx_count",
     "sender_gas_used",
     "priority_fees_wei",
@@ -133,19 +96,12 @@ PER_STEP_METRIC_COLUMNS = (
     "arrived_state_gas",
     "backlog_tx_count",
     "backlog_eligible_tx_count",
-    "backlog_fee_ineligible_tx_count",
     "backlog_execution_gas",
     "backlog_state_gas",
     "backlog_eligible_execution_gas",
     "backlog_eligible_state_gas",
-    "backlog_fee_ineligible_execution_gas",
-    "backlog_fee_ineligible_state_gas",
 )
 
 PER_STEP_COLUMNS = (
     PER_STEP_IDENTITY_COLUMNS + PER_STEP_DEMAND_COLUMNS + PER_STEP_METRIC_COLUMNS
 )
-
-BOTTLENECK_EXECUTION = "execution"
-BOTTLENECK_STATE = "state"
-BOTTLENECK_NONE = "none"

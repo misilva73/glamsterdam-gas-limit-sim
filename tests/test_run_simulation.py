@@ -17,16 +17,13 @@ import pytest
 
 import run_simulation
 import schemas
-from config import DEFAULT_CONFIG, SimulationGrid
+from config import DEFAULT_CONFIG, Scenario, SimulationGrid
 from sim.workload import bootstrap_path, bootstrap_rng, build_cohorts
 from tests.dummy import (
     DUMMY_ANALYSIS_CONFIG_HASH,
     dummy_block_headers,
     dummy_tx_gas_results,
 )
-
-BOOTSTRAP = "moving_block_bootstrap"
-HISTORICAL = "historical"
 
 SCENARIO_KEYS = [
     "aggregate_elasticity",
@@ -44,7 +41,6 @@ def synthetic_per_step(
     windows=(32,),
     num_runs: int = 4,
     positions: int = 24,
-    arrival_mode: str = BOOTSTRAP,
     seed: int = 0,
 ) -> pd.DataFrame:
     """A per-step frame shaped exactly like the engine's output."""
@@ -61,7 +57,6 @@ def synthetic_per_step(
 
     rng = np.random.default_rng(seed)
     position = frame["simulation_position"].to_numpy()
-    window = frame["bootstrap_window_blocks"].to_numpy()
     elasticity = frame["aggregate_elasticity"].to_numpy()
     scale = frame["demand_level"].to_numpy()
     size = len(frame)
@@ -80,10 +75,7 @@ def synthetic_per_step(
     # consistent with what the engine would have recorded.
     multiplier = scale * (base_fee / anchor_price) ** -elasticity
 
-    frame["arrival_mode"] = arrival_mode
     frame["source_block_number"] = 21_000_000 + position
-    frame["window_instance"] = position // window
-    frame["position_in_window"] = position % window
     frame["demand_price_signal"] = base_fee
     frame["cohort_anchor_price"] = anchor_price
     frame["realized_demand_multiplier"] = multiplier
@@ -91,16 +83,8 @@ def synthetic_per_step(
     frame["base_fee_per_gas"] = base_fee.astype(np.int64)
     frame["base_fee_clamped"] = False
     frame["gas_limit"] = gas_limit.astype(np.int64)
-    frame["gas_used"] = np.maximum(execution_gas_used, state_gas_used).astype(np.int64)
     frame["block_execution_gas_used"] = execution_gas_used.astype(np.int64)
     frame["block_state_gas_used"] = state_gas_used.astype(np.int64)
-    frame["execution_utilization"] = execution_utilization
-    frame["state_utilization"] = state_utilization
-    frame["bottleneck_dimension"] = np.where(
-        execution_gas_used >= state_gas_used,
-        schemas.BOTTLENECK_EXECUTION,
-        schemas.BOTTLENECK_STATE,
-    )
     frame["included_tx_count"] = rng.poisson(150, size)
     frame["sender_gas_used"] = (0.9 * execution_gas_used).astype(np.int64)
     frame["priority_fees_wei"] = (frame["included_tx_count"] * 1e15).astype(np.int64)
@@ -109,16 +93,13 @@ def synthetic_per_step(
     frame["arrived_state_gas"] = (state_gas_used * 1.1).astype(np.int64)
     frame["backlog_tx_count"] = backlog_tx_count + ineligible_tx_count
     frame["backlog_eligible_tx_count"] = backlog_tx_count
-    frame["backlog_fee_ineligible_tx_count"] = ineligible_tx_count
     frame["backlog_eligible_execution_gas"] = backlog_tx_count * 120_000
     frame["backlog_eligible_state_gas"] = backlog_tx_count * 45_000
-    frame["backlog_fee_ineligible_execution_gas"] = ineligible_tx_count * 120_000
-    frame["backlog_fee_ineligible_state_gas"] = ineligible_tx_count * 45_000
     frame["backlog_execution_gas"] = (
-        frame["backlog_eligible_execution_gas"] + frame["backlog_fee_ineligible_execution_gas"]
+        frame["backlog_eligible_execution_gas"] + ineligible_tx_count * 120_000
     )
     frame["backlog_state_gas"] = (
-        frame["backlog_eligible_state_gas"] + frame["backlog_fee_ineligible_state_gas"]
+        frame["backlog_eligible_state_gas"] + ineligible_tx_count * 45_000
     )
     return frame[list(schemas.PER_STEP_COLUMNS)]
 
@@ -168,12 +149,8 @@ def test_build_config_applies_every_override(tmp_path):
             "--block-range",
             "21000000",
             "21000399",
-            "--reference-start-block",
-            "21000000",
             "--horizon",
             "120",
-            "--arrival-mode",
-            "historical",
             "--num-runs",
             "5",
             "--seed",
@@ -203,9 +180,7 @@ def test_build_config_applies_every_override(tmp_path):
 
     assert cfg.analysis_config_hash == DUMMY_ANALYSIS_CONFIG_HASH
     assert cfg.source_block_range == (21_000_000, 21_000_399)
-    assert cfg.reference_start_block == 21_000_000
     assert cfg.simulation_horizon_blocks == 120
-    assert cfg.arrival_mode == "historical"
     assert cfg.num_bootstrap_runs == 5
     assert cfg.random_seed == 99
     assert cfg.starting_base_fee == 7_000_000_000
@@ -213,9 +188,9 @@ def test_build_config_applies_every_override(tmp_path):
     assert cfg.price_ema_blocks == 600
     assert cfg.demand_multiplier_bounds == (0.2, 8.0)
     assert cfg.adapt_bids is False
-    # The config carries the grid's first cell so a lone config is consistent.
-    assert (cfg.aggregate_elasticity, cfg.demand_level) == (0.175, 1.0)
-    assert cfg.bootstrap_window_blocks == 16
+    assert not hasattr(cfg, "aggregate_elasticity")
+    assert not hasattr(cfg, "demand_level")
+    assert not hasattr(cfg, "bootstrap_window_blocks")
 
 
 def test_build_config_leaves_unspecified_fields_at_their_defaults():
@@ -240,22 +215,19 @@ def test_build_grid_overrides_the_sweep():
                 "--elasticities", "0", "0.3",
                 "--demand-levels", "1", "3",
                 "--window-blocks", "32",
-                "--no-historical",
             ]
         )
     )
     assert grid.aggregate_elasticities == (0.0, 0.3)
     assert grid.demand_levels == (1.0, 3.0)
     assert grid.bootstrap_window_blocks == (32,)
-    assert grid.include_historical_reference is False
 
 
 def test_build_grid_defaults_to_the_plan_grid():
     grid = run_simulation.build_grid(parse([]))
     assert grid.aggregate_elasticities == (0.10, 0.175, 0.28)
     assert grid.demand_levels == (1.0, 1.5, 2.0)
-    assert grid.bootstrap_window_blocks == (16, 32, 64)
-    assert grid.include_historical_reference is True
+    assert grid.bootstrap_window_blocks == (32,)
 
 
 def test_the_analysis_config_hash_is_mandatory_on_the_command_line():
@@ -264,11 +236,37 @@ def test_the_analysis_config_hash_is_mandatory_on_the_command_line():
         run_simulation.build_parser().parse_args(["--block-range", "1", "2"])
 
 
+def test_headers_and_initial_fee_start_at_the_first_source_cohort(monkeypatch):
+    simulatable = pd.DataFrame({"block_number": [102, 104]})
+    headers = pd.DataFrame(
+        {
+            "block_number": [101, 102, 104],
+            "gas_used": [0, 0, 0],
+            "gas_limit": [60_000_000] * 3,
+            "base_fee_per_gas": [7_000_000_000, 8_000_000_000, 9_000_000_000],
+        }
+    )
+    requested = []
+
+    def fetch(_cfg, first, last):
+        requested.append((first, last))
+        return headers
+
+    monkeypatch.setattr(run_simulation, "fetch_block_headers", fetch)
+    cfg = DEFAULT_CONFIG
+
+    fetched = run_simulation.fetch_headers(cfg, simulatable)
+
+    assert requested == [(101, 104)]
+    assert run_simulation.resolve_starting_base_fee(cfg, fetched, simulatable) == 7_000_000_000
+
+
 def test_bootstrap_paths_are_reproducible_and_independent_across_runs():
-    cohorts = build_cohorts(dummy_cohorts(num_blocks=80))
+    frame = dummy_cohorts(num_blocks=80)
+    cohorts = build_cohorts(frame, dummy_block_headers(frame))
     cfg = run_simulation.build_config(parse(["--seed", "5"]))
     path = lambda c, run: bootstrap_path(
-        cohorts, 40, c.bootstrap_window_blocks, bootstrap_rng(c, run)
+        cohorts, 40, 32, bootstrap_rng(c, run)
     )["cohort_index"].to_numpy()
 
     assert (path(cfg, 0) == path(cfg, 0)).all()
@@ -278,18 +276,11 @@ def test_bootstrap_paths_are_reproducible_and_independent_across_runs():
 
 def test_scenario_summary_reports_one_row_per_scenario():
     axes = dict(elasticities=(0.0, 0.175), levels=(1.0, 3.0), windows=(16, 32))
-    per_step = pd.concat(
-        [
-            synthetic_per_step(**axes),
-            synthetic_per_step(**axes, num_runs=1, arrival_mode=HISTORICAL),
-        ],
-        ignore_index=True,
-    )
+    per_step = synthetic_per_step(**axes)
     summary = run_simulation.scenario_summary(per_step)
 
-    # arrival modes x elasticities x levels x windows
-    assert len(summary) == 2 * 2 * 2 * 2
-    assert summary.loc[summary["arrival_mode"] == BOOTSTRAP, "runs"].eq(4).all()
+    assert len(summary) == 2 * 2 * 2
+    assert summary["runs"].eq(4).all()
     assert summary["median_final_base_fee_gwei"].gt(0).all()
     assert summary["execution_saturated_share"].between(0, 1).all()
     assert summary["median_demand_multiplier"].gt(0).all()
@@ -340,21 +331,15 @@ def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
     per_step = pd.read_parquet(result.run_dir / "per_step")
     assert list(per_step.columns) == list(schemas.PER_STEP_COLUMNS)
     assert per_step["simulation_position"].max() == 40 - 1
-    assert set(per_step["arrival_mode"]) == {BOOTSTRAP, HISTORICAL}
-    assert per_step.groupby("arrival_mode")["run_index"].nunique().to_dict() == {
-        BOOTSTRAP: 3,
-        HISTORICAL: 1,
-    }
-    assert len(result.summary) == 4  # arrival modes x elasticities
+    assert per_step["run_index"].nunique() == 3
+    assert len(result.summary) == 2
 
     # Data only: per-step parts are parquet, the summaries are small CSVs, and a
     # run writes no figures and no CSV copy of the per-step data.
     written = {path.relative_to(result.run_dir).as_posix() for path in result.outputs}
     assert written == {
-        "per_step/e0.0_d2.0_w16_bootstrap.parquet",
-        "per_step/e0.0_d2.0_w16_historical.parquet",
-        "per_step/e0.175_d2.0_w16_bootstrap.parquet",
-        "per_step/e0.175_d2.0_w16_historical.parquet",
+        "per_step/e0.0_d2.0_w16.parquet",
+        "per_step/e0.175_d2.0_w16.parquet",
         "replay_outcome_summary.csv",
         "scenario_summary.csv",
         "manifest.json",
@@ -368,6 +353,7 @@ def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
     assert manifest["resolved"]["simulation_horizon_blocks"] == 40
     assert manifest["grid"]["aggregate_elasticities"] == [0.0, 0.175]
     assert manifest["grid"]["demand_levels"] == [2.0]
+    assert manifest["per_step_columns"] == list(schemas.PER_STEP_COLUMNS)
     assert manifest["timings"]["total_seconds"] > 0
     assert manifest["timings"]["write_seconds"] > 0  # accumulated across cells
     assert "lower bound" in manifest["caveat"].lower()
@@ -379,18 +365,14 @@ def test_each_cell_is_checkpointed_as_it_finishes(tmp_path, offline_data):
 
     on_disk = pd.read_csv(result.run_dir / "scenario_summary.csv")
     pd.testing.assert_frame_equal(on_disk, result.summary, check_dtype=False)
-    # One row per part file, appended cell by cell: the first cell's rows lead.
-    assert on_disk["aggregate_elasticity"].tolist() == [0.0, 0.0, 0.175, 0.175]
-    assert on_disk["arrival_mode"].tolist() == [BOOTSTRAP, HISTORICAL] * 2
+    # One row per part file, appended cell by cell.
+    assert on_disk["aggregate_elasticity"].tolist() == [0.0, 0.175]
 
     for part in sorted((result.run_dir / "per_step").glob("*.parquet")):
         frame = pd.read_parquet(part)
-        # A part holds every run of exactly one cell and one arrival mode.
-        assert frame["arrival_mode"].nunique() == 1
+        # A part holds every bootstrap run of exactly one cell.
         assert len(frame.groupby(SCENARIO_KEYS, observed=True)) == 1
-        assert frame["run_index"].nunique() == (
-            3 if frame["arrival_mode"].iloc[0] == BOOTSTRAP else 1
-        )
+        assert frame["run_index"].nunique() == 3
 
 
 def test_every_run_writes_into_its_own_directory(tmp_path, offline_data):
@@ -401,8 +383,8 @@ def test_every_run_writes_into_its_own_directory(tmp_path, offline_data):
     assert first.run_dir.parent == second.run_dir.parent == tmp_path / "out"
     # Neither run appended into the other, so each is a complete sweep on its own.
     for run_dir in (first.run_dir, second.run_dir):
-        assert len(pd.read_csv(run_dir / "scenario_summary.csv")) == 4
-        assert len(list((run_dir / "per_step").glob("*.parquet"))) == 4
+        assert len(pd.read_csv(run_dir / "scenario_summary.csv")) == 2
+        assert len(list((run_dir / "per_step").glob("*.parquet"))) == 2
 
 
 def test_cell_slug_round_trips_the_axis_values():
@@ -418,20 +400,23 @@ def test_grid_cells_refuses_an_empty_axis():
         run_simulation.grid_cells(SimulationGrid(demand_levels=()))
 
 
-def test_cell_arrival_modes_tracks_what_a_cell_actually_writes():
-    cfg, grid = DEFAULT_CONFIG, SimulationGrid()
-    assert run_simulation.cell_arrival_modes(cfg, grid) == (BOOTSTRAP, HISTORICAL)
-    assert run_simulation.cell_arrival_modes(
-        cfg, SimulationGrid(include_historical_reference=False)
-    ) == (BOOTSTRAP,)
-    assert run_simulation.cell_arrival_modes(
-        cfg.with_(arrival_mode=HISTORICAL), grid
-    ) == (HISTORICAL,)
-    with pytest.raises(ValueError, match="nothing to simulate"):
-        run_simulation.cell_arrival_modes(
-            cfg.with_(num_bootstrap_runs=0),
-            SimulationGrid(include_historical_reference=False),
+def test_grid_cells_builds_validated_scenarios():
+    cells = run_simulation.grid_cells(
+        SimulationGrid(
+            aggregate_elasticities=(0.1,),
+            demand_levels=(1.5,),
+            bootstrap_window_blocks=(32,),
         )
+    )
+    assert cells == [Scenario(0.1, 1.5, 32)]
+
+    with pytest.raises(ValueError, match="demand_level must be positive"):
+        run_simulation.grid_cells(SimulationGrid(demand_levels=(0.0,)))
+
+
+def test_at_least_one_bootstrap_run_is_required():
+    with pytest.raises(ValueError, match="num_bootstrap_runs must be >= 1"):
+        DEFAULT_CONFIG.with_(num_bootstrap_runs=0)
 
 
 # --- resume -----------------------------------------------------------------
@@ -479,7 +464,7 @@ def test_resuming_an_interrupted_sweep_reproduces_the_uninterrupted_one(
     partial = tmp_path / "killed"
     run_dir = interrupted_run(partial, monkeypatch, after=2)
     # Killed mid-sweep: two cells checkpointed, and the manifest says unfinished.
-    assert len(list((run_dir / "per_step").glob("*.parquet"))) == 2 * 2
+    assert len(list((run_dir / "per_step").glob("*.parquet"))) == 2
     assert json.loads((run_dir / "manifest.json").read_text())["completed"] is False
 
     result = run_end_to_end(partial, *FOUR_CELLS, resume=run_dir.name)
@@ -505,16 +490,16 @@ def test_resume_redoes_a_cell_caught_between_its_parts_and_its_summary_row(
     """A crash inside a checkpoint must not leave a summary hole or a duplicate."""
     run_dir = interrupted_run(tmp_path, monkeypatch, after=3)
     summary_path = run_dir / "scenario_summary.csv"
-    # Rewind the third cell's rows, leaving its part files behind: exactly the
+    # Rewind the third cell's row, leaving its part file behind: exactly the
     # state a kill between the parquet write and the CSV append would leave.
-    kept = summary_path.read_text().splitlines()[: 1 + 2 * 2]
+    kept = summary_path.read_text().splitlines()[: 1 + 2]
     summary_path.write_text("\n".join(kept) + "\n")
 
     result = run_end_to_end(tmp_path, *FOUR_CELLS, resume=run_dir.name)
 
     on_disk = pd.read_csv(summary_path)
-    assert len(on_disk) == 4 * 2  # four cells x two arrival modes, no duplicates
-    assert not on_disk.duplicated(SCENARIO_KEYS + ["arrival_mode"]).any()
+    assert len(on_disk) == 4
+    assert not on_disk.duplicated(SCENARIO_KEYS).any()
     pd.testing.assert_frame_equal(on_disk, result.summary, check_dtype=False)
 
 
@@ -530,7 +515,7 @@ def test_resume_refuses_a_run_it_would_contradict(tmp_path, offline_data, monkey
 
     # Nothing was written by any of the refusals.
     assert len(list((tmp_path / "out").iterdir())) == 1
-    assert len(list((run_dir / "per_step").glob("*.parquet"))) == 2 * 2
+    assert len(list((run_dir / "per_step").glob("*.parquet"))) == 2
 
 
 def test_resume_refuses_a_trace_that_moved_under_the_sweep(
@@ -547,6 +532,17 @@ def test_resume_refuses_a_trace_that_moved_under_the_sweep(
         run_end_to_end(tmp_path, *FOUR_CELLS, resume=run_dir.name)
 
 
+def test_resume_refuses_a_different_per_step_schema(tmp_path, offline_data, monkeypatch):
+    run_dir = interrupted_run(tmp_path, monkeypatch, after=2)
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["per_step_columns"].append("old_derived_column")
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="per-step schema"):
+        run_end_to_end(tmp_path, *FOUR_CELLS, resume=run_dir.name)
+
+
 def test_resume_refuses_a_completed_run(tmp_path, offline_data):
     result = run_end_to_end(tmp_path)
 
@@ -554,17 +550,16 @@ def test_resume_refuses_a_completed_run(tmp_path, offline_data):
         run_end_to_end(tmp_path, resume=result.run_dir.name)
 
 
-def test_run_scenario_honours_historical_only_mode():
+def test_run_scenario_returns_only_bootstrap_samples():
     cohorts = anchored_cohorts(num_blocks=40)
     cfg = run_simulation.build_config(parse(["--num-runs", "2"]))
+    scenario = Scenario(0.175, 1.0, 32)
 
-    frames = run_simulation.run_scenario(cohorts, cfg, horizon=10, base_fee=8_000_000_000)
-    assert [f["arrival_mode"].iloc[0] for f in frames] == [BOOTSTRAP] * 2 + [HISTORICAL]
-
-    reference_only = run_simulation.run_scenario(
-        cohorts, cfg.with_(arrival_mode=HISTORICAL), horizon=10, base_fee=8_000_000_000
+    frames = run_simulation.run_scenario(
+        cohorts, cfg, scenario, horizon=10, base_fee=8_000_000_000
     )
-    assert [f["arrival_mode"].iloc[0] for f in reference_only] == [HISTORICAL]
+    assert len(frames) == 2
+    assert [int(f["run_index"].iloc[0]) for f in frames] == [0, 1]
 
 
 def test_library_versions_reports_the_analysis_stack():

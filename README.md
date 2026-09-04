@@ -6,13 +6,15 @@ gas limit ramps from Fusaka's 60M toward 200M under Glamsterdam gas repricing?
 This simulator takes real historical mainnet transactions re-executed under
 Glamsterdam rules (via the `reth-research` replay), replays them as arrival
 cohorts against a gas limit climbing at 1/1024 per block, and reports per-block
-outcomes across a grid of demand scenarios with Monte Carlo bootstrap bands.
+outcomes across a grid of demand scenarios with repeated bootstrap paths for
+downstream uncertainty bands.
 
 Two things distinguish it from a one-dimensional gas model:
 
 - Glamsterdam charges **state gas** (EIP-8037) alongside execution gas, so every
   block has two simultaneous capacity constraints and
-  `gas_used = max(execution, state)`. Which dimension binds is one of the outputs.
+  `gas_used = max(execution, state)`. Both dimension totals are recorded, so the
+  binding dimension remains directly derivable.
 - Demand **responds to price**. How much demand arrives at a step comes from an
   isoelastic demand model calibrated on empirical elasticities and anchored per
   cohort on the price that cohort was historically observed at. Base fee → demand
@@ -37,7 +39,7 @@ python3.12 -m venv .venv
 
 .venv/bin/python run_simulation.py \
     --analysis-config-hash <hash> --block-range <first> <last> \
-    --reference-start-block <block> --num-runs 20
+    --num-runs 20
 
 .venv/bin/python -m pytest -q     # offline, no credentials needed
 ```
@@ -53,9 +55,9 @@ real connection.
 
 ## Flags
 
-Same list as `run_simulation.py --help`. Defaults come from `SimConfig` and
-`SimulationGrid` in `config.py`; what a given run actually resolved to is recorded
-in its `manifest.json`.
+Same list as `run_simulation.py --help`. Fixed defaults come from `SimConfig`, and
+cell defaults come from `SimulationGrid` via `Scenario`, in `config.py`; what a
+given run actually resolved to is recorded in its `manifest.json`.
 
 **Source data** — which replay rows to simulate.
 
@@ -66,7 +68,6 @@ in its `manifest.json`.
 | `--schedule-config-hash HASH` | Pin one revision of `--schedule-name`. | whatever the table holds |
 | `--chain-id N` | Chain of the replay rows. | `1` |
 | `--block-range FIRST LAST` | Inclusive source block range. Required — unbounded scans of the replay table are refused. | — |
-| `--reference-start-block N` | First block of the historical path; its **parent** supplies the starting base fee. | first block of the range |
 | `--cache-dir PATH` | Parquet cache for fetched data. | `data/cache` |
 
 **Simulation** — how one path is run.
@@ -74,7 +75,6 @@ in its `manifest.json`.
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--horizon N` | Arrival steps, i.e. how many cohorts are fed in. | trace length |
-| `--arrival-mode {historical,moving_block_bootstrap}` | `historical` replays the trace once, with no bands; the bootstrap resamples cohort windows. | `moving_block_bootstrap` |
 | `--num-runs N` | Bootstrap paths per grid cell — the width of the p10–p90 band. | `20` |
 | `--seed N` | Master seed; every stream derives from it, so a simulation is reproducible. | `20260831` |
 | `--starting-base-fee WEI` | Override the base fee at step 0. | parent header |
@@ -90,15 +90,14 @@ in its `manifest.json`.
 | `--no-bid-adaptation` | Freeze historical fee caps instead of repricing them from their own block's base fee to the simulated one. Makes the fee filter, not the elasticity, set how much demand is eligible. | off |
 
 **Simulation grid** — every combination of the three axes is a scenario, each run
-`--num-runs` times. The two demand axes multiply, so the defaults are 27 cells;
+`--num-runs` times. The two demand axes multiply, so the defaults are 9 cells;
 narrow them explicitly on a long trace.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--elasticities E [E ...]` | Demand-*shape* axis: aggregate price elasticity. `0` is a flat multiplier with no price response, and is no longer swept by default: with bid adaptation on it cannot shed demand above `--demand-levels 1`, so the base fee runs to the `MAX_BASE_FEE` ceiling and `base_fee_clamped_share` goes non-zero. | `0.10 0.175 0.28` |
 | `--demand-levels A [A ...]` | Demand-*level* axis: latent-demand multiplier at the anchor price, standing in for never-included and secular-growth demand. | `1 1.5 2` |
-| `--window-blocks L [L ...]` | Bootstrap axis: length in cohorts of each resampled window. | `16 32 64` |
-| `--no-historical` | Skip the historical reference path (bands only). | off |
+| `--window-blocks L [L ...]` | Bootstrap window length in cohorts. Pass multiple values for an explicit robustness sweep. | `32` |
 | `--output-dir PATH` | Parent of the timestamped directory this run writes. | `output/` |
 | `--resume STAMP` | Continue an interrupted run: the name of its directory under `--output-dir`. Cells already checkpointed there are skipped and the rest are written into the same directory. Refused unless the config, grid, seed, and resolved trace all match the run being resumed. | off |
 
@@ -111,19 +110,19 @@ Every column is documented in `METHODOLOGY.md` §8.
 ```text
 output/20260904T083556Z/
 ├── per_step/
-│   ├── e0.1_d1.0_w16_bootstrap.parquet     every bootstrap run of that cell
-│   ├── e0.1_d1.0_w16_historical.parquet    that cell's reference path
-│   └── ...                                 one pair per grid cell
+│   ├── e0.1_d1.0_w16.parquet     every bootstrap run of that cell
+│   └── ...                       one part per grid cell
 ├── scenario_summary.csv
 ├── replay_outcome_summary.csv
 └── manifest.json
 ```
 
 - `per_step/` — one row per simulated block: base fee, gas limit,
-  header-equivalent gas used, execution/state gas and utilisation, bottleneck
-  dimension, included transactions, sender-facing gas, priority fees, arrivals by
-  dimension, eligible / fee-ineligible backlog by count and both gas dimensions,
-  and the demand model's own state. Written **one grid cell at a time, as each
+  execution/state gas, included transactions, sender-facing gas, priority fees,
+  arrivals by dimension, total and eligible backlog by count and both gas
+  dimensions, and the demand model's own state. Header-equivalent gas used,
+  utilisation, bottleneck, and fee-ineligible backlog are exact derivations from
+  those columns rather than duplicated storage. Written **one grid cell at a time, as each
   cell finishes**: a sweep never holds more than the cell in flight, and an
   interrupted run keeps every cell that completed. Read the whole sweep back as
   one frame with `pd.read_parquet("output/<stamp>/per_step")` — every part shares

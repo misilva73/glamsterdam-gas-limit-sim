@@ -1,22 +1,20 @@
 """Configuration for the Fusaka -> Glamsterdam gas-limit simulation.
 
-One dataclass holds every knob. Seeds for the independent random streams are
-derived from `random_seed` so that changing, say, the demand-replication draw
+`SimConfig` holds fixed run controls, `Scenario` holds one grid cell, and
+`SimulationGrid` holds the swept axes. Seeds for the independent random streams
+are derived from `random_seed` so that changing, say, the demand-replication draw
 cannot silently shift the bootstrap window selection.
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "cache"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "output"
-
-ArrivalMode = Literal["historical", "moving_block_bootstrap"]
 
 GAS_LIMIT_RAMP_DENOMINATOR = 1024
 """EIP-1559 per-block gas-limit adjustment bound: 1/1024 of the parent limit."""
@@ -70,24 +68,16 @@ class SimConfig:
 
     # --- Source trace --------------------------------------------------------
     source_block_range: tuple[int, int] | None = None
-    reference_start_block: int | None = None
 
     # --- Simulation ----------------------------------------------------------
     simulation_horizon_blocks: int | None = None  # None -> source trace length
-    arrival_mode: ArrivalMode = "moving_block_bootstrap"
-    bootstrap_window_blocks: int = 32
     starting_base_fee: int | None = None  # None -> derived from parent header
     num_bootstrap_runs: int = 20
     random_seed: int = 20260831
 
     # --- Demand model --------------------------------------------------------
-    # Isoelastic aggregate demand against a smoothed effective gas price:
-    #   m = demand_level * (price_signal / cohort_anchor_price) ** -aggregate_elasticity
-    # See METHODOLOGY.md section 6. `aggregate_elasticity = 0` reduces the model to
-    # a flat `demand_level` multiplier and is the one mode needing no anchor
-    # prices. It is not swept -- see `SimulationGrid` for why.
-    aggregate_elasticity: float = 0.175
-    demand_level: float = 1.0
+    # The swept elasticity and demand level live in `Scenario`; these are fixed
+    # controls shared by every cell in a run.
     price_ema_blocks: int = 300
     demand_multiplier_bounds: tuple[float, float] = (0.05, 20.0)
     # Reprice historical fee caps from their own block's base fee to the
@@ -120,20 +110,13 @@ class SimConfig:
     output_dir: Path = DEFAULT_OUTPUT_DIR
 
     def __post_init__(self) -> None:
-        if self.demand_level <= 0:
-            raise ValueError("demand_level must be positive")
-        if self.aggregate_elasticity < 0:
-            raise ValueError(
-                "aggregate_elasticity is the absolute value of a negative slope, "
-                "so it must be >= 0; a negative value would make demand rise with price"
-            )
+        if self.num_bootstrap_runs < 1:
+            raise ValueError("num_bootstrap_runs must be >= 1")
         if self.price_ema_blocks < 1:
             raise ValueError("price_ema_blocks must be >= 1")
         low, high = self.demand_multiplier_bounds
         if not 0 < low <= high:
             raise ValueError(f"demand_multiplier_bounds must satisfy 0 < low <= high, got {(low, high)}")
-        if self.bootstrap_window_blocks < 1:
-            raise ValueError("bootstrap_window_blocks must be >= 1")
 
     # --- Derived seeds -------------------------------------------------------
     def derived_seed(self, stream: str) -> int:
@@ -161,6 +144,26 @@ class SimConfig:
 
 
 @dataclass(frozen=True)
+class Scenario:
+    """The three per-cell values swept by `SimulationGrid`."""
+
+    aggregate_elasticity: float
+    demand_level: float
+    bootstrap_window_blocks: int
+
+    def __post_init__(self) -> None:
+        if self.aggregate_elasticity < 0:
+            raise ValueError(
+                "aggregate_elasticity is the absolute value of a negative slope, "
+                "so it must be >= 0; a negative value would make demand rise with price"
+            )
+        if self.demand_level <= 0:
+            raise ValueError("demand_level must be positive")
+        if self.bootstrap_window_blocks < 1:
+            raise ValueError("bootstrap_window_blocks must be >= 1")
+
+
+@dataclass(frozen=True)
 class SimulationGrid:
     """Axes swept by a simulation; each combination gets `num_bootstrap_runs` paths.
 
@@ -179,8 +182,7 @@ class SimulationGrid:
 
     aggregate_elasticities: tuple[float, ...] = (0.10, 0.175, 0.28)
     demand_levels: tuple[float, ...] = (1.0, 1.5, 2.0)
-    bootstrap_window_blocks: tuple[int, ...] = (16, 32, 64)
-    include_historical_reference: bool = True
+    bootstrap_window_blocks: tuple[int, ...] = (32,)
 
 
 DEFAULT_CONFIG = SimConfig()

@@ -49,7 +49,7 @@ def offline_block_headers(
     so regenerating from a shifted start would describe a *different* trace than
     the one being simulated -- and the derived starting base fee would not match
     the demand it is supposed to summarise. Blocks before the anchor (the parent
-    of the reference start block) inherit the anchor block's header.
+    of the first source cohort) inherit the anchor block's header.
     """
     anchor = cfg.source_block_range[0] if cfg.source_block_range else first_block
     replay_rows = dummy_tx_gas_results(
@@ -100,6 +100,5 @@ def offline_cfg(tmp_path) -> SimConfig:
         analysis_config_hash=DUMMY_ANALYSIS_CONFIG_HASH,
         schedule_config_hash=DUMMY_SCHEDULE_CONFIG_HASH,
         source_block_range=(FIRST_BLOCK, LAST_BLOCK),
-        reference_start_block=FIRST_BLOCK + 1,
         cache_dir=tmp_path / "cache",
     )

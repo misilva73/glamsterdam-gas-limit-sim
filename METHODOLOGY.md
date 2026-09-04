@@ -21,8 +21,8 @@ It combines two historical inputs:
 2. Historical block headers, used for base-fee initialization and to anchor each
    source block's observed demand to its historical price.
 
-Transactions arrive in source-block cohorts. A run either preserves their
-historical order or resamples contiguous windows with a moving-block bootstrap.
+Transactions arrive in source-block cohorts resampled in contiguous windows with
+a moving-block bootstrap.
 An isoelastic demand curve changes the quantity arriving as the simulated price
 changes. Pending transactions are ordered by effective tip and greedily included
 only when they fit both execution-gas and state-gas capacity.
@@ -82,7 +82,7 @@ load, validate, derive gas dimensions, cache
                   ↓
 group transactions into source-block cohorts
                   ↓
-construct a historical or bootstrap arrival path
+construct a moving-block-bootstrap arrival path
                   ↓
 simulate demand, mempool, block fill, gas limit, and base fee
                   ↓
@@ -143,10 +143,10 @@ The normal pipeline uses headers for:
 
 - each cohort's historical base fee, needed for its demand anchor and bid
   adaptation;
-- the base fee of the actual parent of `reference_start_block`, used as the
+- the base fee of the actual parent of the first source cohort, used as the
   simulation's initial base fee unless explicitly overridden.
 
-The fetch therefore starts one block before the first reference block.
+The fetch therefore starts one block before the first source cohort.
 `canonical_beacon_block FINAL` is used only to translate a slot-time interval into
 an execution-block range.
 
@@ -232,7 +232,8 @@ never a capacity input.
 
 ### 4.3 Configuration and grid
 
-All single-run parameters live in `config.SimConfig`; swept axes live in
+Fixed run parameters live in `config.SimConfig`; one cell's elasticity, demand
+level, and bootstrap window live in `config.Scenario`; their swept axes live in
 `config.SimulationGrid`. `README.md` is the complete flag reference, and every
 resolved value is written to `manifest.json`.
 
@@ -244,12 +245,12 @@ Key defaults are:
 | ramp rate | current limit ÷ 1024 per block |
 | elasticities | 0.10, 0.175, 0.28 |
 | demand levels | 1, 1.5, 2 |
-| bootstrap windows | 16, 32, 64 cohorts |
+| bootstrap window | 32 cohorts |
 | bootstrap runs per cell | 20 |
 | price EMA span | 300 blocks |
 | price-response bounds | 0.05, 20 |
 
-The defaults form 27 grid cells before repeated runs and historical references.
+The defaults form 9 grid cells before repeated bootstrap runs.
 High-demand cells dominate runtime because each block scans a growing mempool.
 
 ## 5. Workload model
@@ -267,18 +268,14 @@ replica_index)`; hashes are omitted from the hot path to save memory.
 
 ### 5.2 Arrival paths
 
-`historical` uses cohorts once in their original order. The horizon must not exceed
-the available cohorts.
-
-`moving_block_bootstrap` draws window starts uniformly with replacement, copies
+The simulation draws window starts uniformly with replacement, copies
 `L` contiguous cohorts from each start, and truncates the concatenated path to the
 horizon. Windows do not wrap around the trace. Each occurrence has a unique
 `window_instance`.
 
 Run `k` uses the same bootstrap windows in every demand scenario. These common
 random numbers make scenario differences reflect parameters rather than different
-window draws. A matching historical path is included by default as a reference,
-not as part of the bootstrap bands.
+window draws.
 
 ### 5.3 Choosing the bootstrap length `L`
 
@@ -286,14 +283,15 @@ not as part of the bootstrap bands.
 across blocks, so cohort size, gas mix, and fee level are all autocorrelated -- and
 short enough that resampling still produces genuinely new paths.
 
-**`L` is not estimated; it is swept.** The grid runs every candidate (16, 32, 64 by
-default) and the answer is judged by whether conclusions move across them. A
-conclusion that holds at all three does not depend on the choice; one that does not
-is a finding about `L`, not about the gas limit.
+The default is `L = 32`, keeping the ordinary run focused on the two substantive
+demand axes. Pass multiple values such as `--window-blocks 16 32 64` for a
+separate robustness sweep. A conclusion that holds at all three does not depend
+on the choice; one that does not is a finding about `L`, not about the gas limit.
 
 An earlier version reported an autocorrelation-based suggestion per run. It was
-dropped: it never fed the simulation, it recomputed an identical answer once per
-grid cell, and sweeping `L` answers the same question more directly.
+dropped because it never fed the simulation. The default remains a modelling
+choice that should be re-derived on the real trace; the explicit sweep tests how
+much conclusions depend on it.
 
 ## 6. Demand model
 
@@ -325,7 +323,8 @@ elasticity estimates were calibrated. It is not the block-capacity measure
 `demand_level` sets latent demand at the anchor price. It represents secular
 growth and demand missing from an included-only trace. `aggregate_elasticity`
 sets how quantity responds to price. With elasticity zero, the multiplier is
-always `demand_level` and needs no price anchor.
+always `demand_level`, although cohorts remain anchored because the engine has
+one unconditional input contract.
 
 The default elasticity grid follows the central estimate 0.175 and rounded
 event-based range 0.10–0.28 in the
@@ -369,8 +368,7 @@ For multiplier `m`, arrivals contain:
    `execution_gas + state_gas` crosses the remaining gas target.
 
 The crossing transaction is retained, so the target may be exceeded by at most
-one sampled transaction. Remainders are sampled from the current bootstrap window;
-for a historical path they use a trailing window of length `L`.
+one sampled transaction. Remainders are sampled from the current bootstrap window.
 
 Arrivals are sorted by source position and replica index before admission. This
 preserves the engine's deterministic append-only mempool order.
@@ -499,14 +497,14 @@ used_state + tx_state <= gas_limit
 The rule is **skip and continue**. A transaction that does not fit stays pending,
 and a later, smaller transaction may still be included.
 
-`bottleneck_dimension` is whichever included-gas total is larger. Ties are
-reported as `execution`; `none` is used only when both totals are zero.
+The binding dimension is whichever included-gas total is larger. It is derived
+from the two recorded totals when needed rather than stored as another column.
 
 ### 7.6 Backlog
 
 Backlog is measured after inclusion at the current block's base fee. Counts,
-execution gas, and state gas are each reported as total, eligible, and
-fee-ineligible.
+execution gas, and state gas are each reported as total and eligible;
+fee-ineligible backlog is exactly `total - eligible`.
 
 Actual sampled arrivals are also recorded per step. They cannot be reconstructed
 exactly from the cohort and multiplier because fractional sampling accepts an
@@ -538,12 +536,11 @@ and its run index, not from the order cells were executed in.
 
 ### 8.1 Per-step data
 
-Per-step data is a directory of parquet parts, `per_step/<cell>_<mode>.parquet` —
-one part per grid cell and arrival mode, holding every run of that cell:
+Per-step data is a directory of parquet parts, `per_step/<cell>.parquet` — one
+part per grid cell, holding every bootstrap run of that cell:
 
 ```text
-per_step/e0.175_d1.5_w32_bootstrap.parquet     runs 0..num_bootstrap_runs-1
-per_step/e0.175_d1.5_w32_historical.parquet    the matching reference path
+per_step/e0.175_d1.5_w32.parquet     runs 0..num_bootstrap_runs-1
 ```
 
 The cell stem is `e<aggregate_elasticity>_d<demand_level>_w<bootstrap_window_blocks>`,
@@ -561,21 +558,26 @@ small summaries stay CSV because they are meant to be read directly.
 
 | Group | Columns |
 | --- | --- |
-| identity | `arrival_mode`, `run_index`, `aggregate_elasticity`, `demand_level`, `bootstrap_window_blocks`, `simulation_position`, `source_block_number`, `window_instance`, `position_in_window` |
+| identity | `run_index`, `aggregate_elasticity`, `demand_level`, `bootstrap_window_blocks`, `simulation_position`, `source_block_number` |
 | demand | `demand_price_signal`, `cohort_anchor_price`, `realized_demand_multiplier`, `demand_multiplier_clamped` |
-| capacity | `base_fee_per_gas`, `base_fee_clamped`, `gas_limit`, `gas_used`, `block_execution_gas_used`, `block_state_gas_used`, `execution_utilization`, `state_utilization`, `bottleneck_dimension` |
+| capacity | `base_fee_per_gas`, `base_fee_clamped`, `gas_limit`, `block_execution_gas_used`, `block_state_gas_used` |
 | included | `included_tx_count`, `sender_gas_used`, `priority_fees_wei` |
 | arrivals | `arrived_tx_count`, `arrived_execution_gas`, `arrived_state_gas` |
-| backlog | `backlog_tx_count`, `backlog_eligible_tx_count`, `backlog_fee_ineligible_tx_count`, plus execution/state gas with the same total/eligible/fee-ineligible split |
+| backlog | `backlog_tx_count`, `backlog_eligible_tx_count`, plus total and eligible execution/state gas |
 
 Units are wei and gas unless a name states otherwise. `priority_fees_wei` is
 `float64` because plausible block totals can exceed signed `int64`.
 
+Exact derived quantities are intentionally not stored: `gas_used` is the maximum
+of the two block-gas columns; utilization divides either by `gas_limit`; the
+bottleneck compares them; fee-ineligible backlog subtracts eligible from total;
+and bootstrap window coordinates follow from `simulation_position` and `L`.
+
 ### 8.2 Scenario summary
 
-`scenario_summary.csv` groups by `arrival_mode`, `aggregate_elasticity`,
-`demand_level`, and `bootstrap_window_blocks` — one row per part file, appended in
-grid order as each cell is checkpointed. Its metrics are
+`scenario_summary.csv` groups by `aggregate_elasticity`, `demand_level`, and
+`bootstrap_window_blocks` — one row per part file, appended in grid order as each
+cell is checkpointed. Its metrics are
 `execution_saturated_share`, `state_saturated_share`,
 `median_demand_multiplier`, `max_demand_multiplier`,
 `multiplier_clamped_share`, `base_fee_clamped_share`, `runs`, `ended_empty_share`,
@@ -586,16 +588,15 @@ grid order as each cell is checkpointed. Its metrics are
 
 - `replay_outcome_summary.csv`: the whole trace broken down by replay outcome (§4.1). Nothing is excluded; this reports what is being simulated.
 - `manifest.json`: resolved config and grid, seeds, source range, initial base fee,
-  library versions, timings, the run directory, output paths relative to it, and
-  the standing caveat. Written before the first cell and again at the end;
+  per-step schema, library versions, timings, the run directory, output paths
+  relative to it, and the standing caveat. Written before the first cell and again at the end;
   `completed` distinguishes the two, so `completed: false` marks a directory that
   holds only the cells that finished and is what `--resume` reads. Timings and
   outputs are those of the last invocation.
 
-A run writes data and nothing else -- no figures, no analysis. Reading the results
-belongs in `notebooks/`, where `analysis.bands.aggregate_bands` collapses the
-bootstrap runs into per-position p10-p90 bands. The historical path is a separate
-reference and is never folded into those bands.
+A run writes data and nothing else -- no figures, no analysis. A downstream
+analysis can group by the scenario keys and `simulation_position`, then calculate
+per-position quantiles such as p10-p90 across `run_index`.
 
 ## 9. Assumptions
 
@@ -646,12 +647,10 @@ State these whenever reporting results from this repository.
   single-scenario setting, where `demand_level <= 1` keeps it meaningful.
 - `L` changes which dependence structure the bootstrap preserves. If conclusions
   change across `L`, the dependence structure is doing the work, not the gas limit.
-- The historical line shows the original cohort ordering under simulated rules.
-  It is a reference path, not observed historical outcomes and not a confidence
-  interval.
 
 Execution and state utilisation share a denominator and do not add to 100%.
-Compare `bottleneck_dimension` or saturation shares to learn which resource binds.
+Compare the two block-gas columns or the saturation shares to learn which resource
+binds.
 Check `replay_outcome_summary.csv`, because the share of state gas sitting in
 `schedule_gas_rescuable` rows says how much of the simulated demand depends on
 senders raising their signed gas limits.

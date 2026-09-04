@@ -22,7 +22,8 @@ counterfactual EVM replay**.
 ## Layout and ownership
 
 ```text
-config.py                     SimConfig (every knob), SimulationGrid, protocol constants
+config.py                     SimConfig (fixed run controls), Scenario (one cell),
+                              SimulationGrid (swept axes), protocol constants
 schemas.py                    column contracts shared by all three layers
 conftest.py                   makes the repo root importable for bare `pytest`
 
@@ -30,8 +31,8 @@ data/load_tx_gas_results.py   ClickHouse loading, filtering, gas derivation
 data/fetch_blocks.py          Xatu block headers, block-range resolution, starting base fee
 data/cache.py                 Parquet + JSON-sidecar cache used by both loaders
 
-sim/workload.py               cohorts + demand anchors, arrival paths (historical /
-                              moving-block bootstrap), the demand model (multiplier,
+sim/workload.py               cohorts + demand anchors, moving-block-bootstrap paths,
+                              the demand model (multiplier,
                               sampling pools, gas-target sampling, bid adaptation),
                               RNG streams
 sim/engine.py                 the per-block loop: fee update, gas-limit ramp, demand
@@ -142,11 +143,9 @@ Model in `METHODOLOGY.md` §6.
   its tip, so scaling its gas price would scale the tip; shifting holds it
   absolute, matching what leaving `max_priority_fee_per_gas` alone does for
   dynamic-fee rows. Both preserve eligibility exactly.
-- **Anchors are required for either price-responsive feature.** `build_cohorts`
-  needs `headers`; `run_path` refuses `aggregate_elasticity != 0` or `adapt_bids`
-  without them, naming which. `aggregate_elasticity=0` plus `adapt_bids=False` is
-  the pre-demand-model behaviour and needs no headers — that is what the mechanism
-  tests run under.
+- **Every cohort is anchored.** `build_cohorts` always requires `headers`; there is
+  no headerless engine mode. This keeps bid adaptation and the demand fixed point
+  on one invariant even when a scenario uses zero elasticity.
 - **Arrivals are recorded, not derived.** Sampling means `arrived_*_gas` cannot be
   recomputed from the path plus a scalar, so anything reconciling arrivals against
   the backlog must read those columns.
@@ -157,17 +156,17 @@ Model in `METHODOLOGY.md` §6.
 
 ## Behavioural decisions worth knowing
 
-- **A checkpoint writes data before the summary row describing it**, and
-  `cell_arrival_modes` fixes how many part files and summary rows every cell
-  produces. Those two facts are what `--resume` reads the disk with: complete
-  cells are the leading run of cells whose parts are all present, bounded by
-  `summary_rows // len(modes)`, and the summary is truncated to that. Reordering
-  the writes, or letting a cell emit a mode the sweep did not declare, silently
-  breaks resume — hence the assert in `checkpoint_cell`.
+- **Arrival paths are bootstrap-only.** Every cell runs
+  `num_bootstrap_runs` moving-block-bootstrap samples. There is no historical-only
+  mode, historical reference path, or `arrival_mode` output dimension.
+- **A checkpoint writes its one cell part before the summary row describing it.**
+  `--resume` treats complete cells as the leading run whose parts are present,
+  bounded by the summary row count, and truncates the summary to that prefix.
+  Reordering those writes silently breaks resume.
 - **The manifest is written twice**, before the first cell and at the end, and
   `completed` tells them apart. `--resume` compares the stored `config`, `grid`,
-  and `resolved` against the current ones and refuses on any difference except
-  the path fields in `RESUME_EXEMPT_CONFIG_FIELDS`.
+  per-step schema, and `resolved` against the current ones and refuses on any
+  difference except the path fields in `RESUME_EXEMPT_CONFIG_FIELDS`.
 - **Both persistent-state updates are parent-derived.** Neither the base fee nor
   the ramp is applied at position 0, so the first recorded block reports the
   configured initial state verbatim and the ramp first applies at position 1.
@@ -175,7 +174,7 @@ Model in `METHODOLOGY.md` §6.
 - **`tx_hash` is not carried through cohorts or expansion.** A week is ~8M rows and
   object-dtype hashes cost ~1 GB. Identity is `(run_index, window_instance,
   source_block_number, tx_index, replica_index)`, 1:1 with a `tx_hash`-based one.
-  `schemas.WORKLOAD_COLUMNS` is consequently never materialised as a frame.
+  Expanded workload is kept only in the engine's parallel arrays, never a frame.
 - **`priority_fees_wei` is float64 end to end, including the output column**: a
   200M-gas block of 500-gwei-tip transactions overflows int64 (~1e20). Converting
   to a Python int would survive the sum but make the column object-dtype and break
@@ -192,7 +191,7 @@ Model in `METHODOLOGY.md` §6.
   replay rows has no cohort), so bootstrap windows are contiguous in
   *cohort index*, not block number. The induced sampling remainder is drawn from
   the step's whole window rather than the arriving cohort, which would make it a
-  near copy of one block; under `historical` the pool is a trailing window instead.
+  near copy of one block.
 - **Gas-target sampling accepts its overshoot**, keeping the draw that crosses the
   target rather than Bernoulli-correcting it: the error is one transaction against
   a cohort-scale target. `_MAX_SAMPLING_BATCHES` raises rather than looping forever
@@ -204,14 +203,9 @@ Model in `METHODOLOGY.md` §6.
   would starve every legacy transaction — so the branch stays testable. **Check
   what the real producer writes**; the gas price would also work, but a null would
   need the loader's dtype handling revisited.
-- `historical_path` raises rather than truncating when `horizon > len(cohorts)`; a
-  short reference path would misalign against bands aggregated by
-  `simulation_position`.
-- `aggregate_bands` requires a single `arrival_mode` and raises otherwise, rather
-  than folding the historical reference into the bands it is compared against.
 - Backlog is measured **post-inclusion**, with the eligible/fee-ineligible split
-  taken at the current block's base fee.
-- Bottleneck ties go to `execution`; `none` only when both dimensions are zero.
+  taken at the current block's base fee. Per-step output stores total and eligible
+  values; fee-ineligible values are their exact difference.
 - `ramp_gas_limit` never steps down.
 
 ### No per-transaction gas limit is modelled
@@ -252,7 +246,7 @@ at high demand the backlog grows monotonically, so throughput falls with horizon
 A full-week 5x cell is ~8.4 min/path, so 20 bootstrap runs ≈ 2.8 h at ~1.8 GB per
 worker; low-demand cells are essentially free. **Plan the grid accordingly** — cost
 is dominated entirely by the cells whose realized multiplier runs high, and the two
-demand axes multiply (the defaults are 27 cells).
+demand axes multiply (the defaults are 9 cells at the single default `L = 32`).
 
 Memory no longer scales with the grid: each cell is written to `per_step/` and
 freed before the next one starts, so the retained source frame and cohorts set the
@@ -299,8 +293,8 @@ implementations, and compaction cadence is asserted not to change output.
 ## Conventions
 
 - Python 3.12, pandas 3.x (copy-on-write default — no chained assignment, no
-  `inplace=`), numpy. matplotlib/seaborn are notebook-only: a simulation run
-  draws nothing and depends on neither.
+  `inplace=`), numpy. No plotting dependencies at all: a simulation run writes
+  data and draws nothing.
 - Flat layout, plain functions, dataclasses for config. No class hierarchies,
   registries, or dependency injection.
 - Comments explain protocol subtleties, dataset caveats, and *why* — not what the

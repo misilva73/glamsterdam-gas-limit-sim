@@ -7,7 +7,7 @@ one network and bounded, because Xatu holds every network's full history and an
 unbounded scan is expensive for everyone.
 
 Headers supply only two things the simulation needs: the counterfactual starting
-base fee (from the actual parent of `reference_start_block`) and the historical
+base fee (from the actual parent of the first source cohort) and the historical
 gas_used/gas_limit series used as an observed-behaviour reference.
 """
 
@@ -196,17 +196,17 @@ def _headers_provenance(
 # --- Derived initial state --------------------------------------------------------
 
 
-def starting_base_fee(headers: pd.DataFrame, reference_start_block: int) -> int:
-    """Base fee of the ACTUAL parent of `reference_start_block`.
+def starting_base_fee(headers: pd.DataFrame, start_block: int) -> int:
+    """Base fee of the ACTUAL parent of `start_block`.
 
     EIP-1559 makes a block's base fee a function of its parent, so the
     counterfactual run must start from the parent header, not the start block itself.
     """
-    parent = int(reference_start_block) - 1
+    parent = int(start_block) - 1
     row = headers.loc[headers["block_number"] == parent, "base_fee_per_gas"]
     if row.empty:
         raise ValueError(
-            f"parent block {parent} of reference_start_block {reference_start_block} "
+            f"parent block {parent} of start block {start_block} "
             "is missing from the header frame; extend the fetched range by one block"
         )
     return int(row.iloc[0])

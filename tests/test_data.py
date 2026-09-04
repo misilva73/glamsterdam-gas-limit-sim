@@ -450,10 +450,10 @@ def test_starting_base_fee_raises_when_the_parent_is_absent():
 
 
 def test_starting_base_fee_on_the_dummy_header_frame(offline_cfg, offline_data):
-    headers = fetch_blocks.fetch_block_headers(offline_cfg, FIRST_BLOCK, LAST_BLOCK)
-    base_fee = fetch_blocks.starting_base_fee(headers, offline_cfg.reference_start_block)
+    headers = fetch_blocks.fetch_block_headers(offline_cfg, FIRST_BLOCK - 1, LAST_BLOCK)
+    base_fee = fetch_blocks.starting_base_fee(headers, FIRST_BLOCK)
     assert base_fee == int(
-        headers.loc[headers["block_number"] == FIRST_BLOCK, "base_fee_per_gas"].iloc[0]
+        headers.loc[headers["block_number"] == FIRST_BLOCK - 1, "base_fee_per_gas"].iloc[0]
     )
 
 

@@ -23,7 +23,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from config import SimConfig
+from config import Scenario, SimConfig
 from sim.metrics import effective_tip, is_legacy_tx_type
 
 # Columns `build_cohorts` needs; `execution_gas` / `state_gas` are derived by the
@@ -46,8 +46,6 @@ PATH_COLUMNS = (
     "window_instance",
     "position_in_window",
 )
-
-HISTORICAL_MODE = "historical"
 
 _MAX_SAMPLING_BATCHES = 64
 """Safety cap on gas-target sampling batches, so a degenerate pool cannot hang."""
@@ -75,16 +73,15 @@ class Cohorts:
 
     `anchor_price` is per cohort: the effective gas price at which that cohort's
     demand was actually observed (its header base fee plus its realised
-    gas-weighted mean tip). `None` when no headers were supplied, which forces
-    the caller into the flat-multiplier, frozen-bid mode.
+    gas-weighted mean tip).
     """
 
     block_numbers: np.ndarray
     offsets: np.ndarray
     columns: dict[str, np.ndarray]
     total_gas: np.ndarray
-    anchor_price: np.ndarray | None = None
-    anchor_tip: np.ndarray | None = None
+    anchor_price: np.ndarray
+    anchor_tip: np.ndarray
 
     def __len__(self) -> int:
         return int(self.block_numbers.size)
@@ -101,18 +98,12 @@ class Cohorts:
     def tx_counts(self) -> np.ndarray:
         return np.diff(self.offsets)
 
-    @property
-    def has_anchors(self) -> bool:
-        return self.anchor_price is not None
 
-
-def build_cohorts(tx_frame: pd.DataFrame, headers: pd.DataFrame | None = None) -> Cohorts:
+def build_cohorts(tx_frame: pd.DataFrame, headers: pd.DataFrame) -> Cohorts:
     """Flatten simulatable transactions into cohorts, one per source block.
 
     `headers` supplies the historical base fee per source block, which the demand
-    model anchors on and the bid rescale prices against. Without it the returned
-    `Cohorts` has no `anchor_price`, and the engine will refuse any config that
-    needs one.
+    model anchors on and the bid rescale prices against.
     """
     missing = [c for c in COHORT_SOURCE_COLUMNS if c not in tx_frame.columns]
     if missing:
@@ -136,11 +127,9 @@ def build_cohorts(tx_frame: pd.DataFrame, headers: pd.DataFrame | None = None) -
     columns["is_legacy"] = is_legacy_tx_type(columns["tx_type"])
     total_gas = columns["execution_gas"] + columns["state_gas"]
 
-    anchor_price = anchor_tip = None
-    if headers is not None:
-        anchor_base_fee, anchor_tip = _cohort_anchors(columns, block_numbers, counts, headers)
-        columns["anchor_base_fee"] = anchor_base_fee
-        anchor_price = anchor_base_fee[offsets[:-1]].astype(np.float64) + anchor_tip
+    anchor_base_fee, anchor_tip = _cohort_anchors(columns, block_numbers, counts, headers)
+    columns["anchor_base_fee"] = anchor_base_fee
+    anchor_price = anchor_base_fee[offsets[:-1]].astype(np.float64) + anchor_tip
     return Cohorts(
         block_numbers=block_numbers,
         offsets=offsets,
@@ -215,17 +204,6 @@ def _segment_sum(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
     return np.add.reduceat(values, starts)
 
 
-def historical_path(cohorts: Cohorts, horizon: int) -> pd.DataFrame:
-    """Cohorts in their original continuous order -- the reference path."""
-    if horizon > len(cohorts):
-        raise ValueError(
-            f"historical horizon {horizon} exceeds the {len(cohorts)}-cohort source trace"
-        )
-    position = np.arange(horizon, dtype=np.int64)
-    return _path_frame(cohorts, cohort_index=position, window_instance=np.zeros_like(position),
-                       position_in_window=position)
-
-
 def bootstrap_path(
     cohorts: Cohorts, horizon: int, window_blocks: int, rng: np.random.Generator
 ) -> pd.DataFrame:
@@ -270,31 +248,22 @@ def _path_frame(
 # --- Demand model -----------------------------------------------------------------
 
 
-def demand_pool_bounds(
-    cohorts: Cohorts, path: pd.DataFrame, window_blocks: int, arrival_mode: str
-) -> tuple[np.ndarray, np.ndarray]:
+def demand_pool_bounds(cohorts: Cohorts, path: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Per step, the half-open flat-array slice induced demand is drawn from.
 
     Drawing the increment from the arriving cohort alone would make it a near
     copy of that one block. The pool is the bootstrap window the step belongs to
     -- contiguous in cohort index, hence a contiguous slice of the flat arrays,
-    so sampling is an integer draw with no gather to build the pool. Under
-    `historical` every step shares one window instance, so the pool is instead a
-    trailing window of the same length.
+    so sampling is an integer draw with no gather to build the pool.
     """
-    cohort_index = path["cohort_index"].to_numpy(np.int64)
-    if arrival_mode == HISTORICAL_MODE:
-        first = np.maximum(cohort_index - window_blocks + 1, 0)
-        last = cohort_index
-    else:
-        grouped = path.groupby("window_instance")["cohort_index"]
-        first = path["window_instance"].map(grouped.min()).to_numpy(np.int64)
-        last = path["window_instance"].map(grouped.max()).to_numpy(np.int64)
+    grouped = path.groupby("window_instance")["cohort_index"]
+    first = path["window_instance"].map(grouped.min()).to_numpy(np.int64)
+    last = path["window_instance"].map(grouped.max()).to_numpy(np.int64)
     return cohorts.offsets[first], cohorts.offsets[last + 1]
 
 
 def demand_multiplier(
-    cfg: SimConfig, price_signal: float, anchor_price: float
+    cfg: SimConfig, scenario: Scenario, price_signal: float, anchor_price: float
 ) -> tuple[float, bool]:
     """Isoelastic demand at `price_signal`, relative to the cohort's anchor.
 
@@ -309,12 +278,12 @@ def demand_multiplier(
     deliberate choice by the caller about how much latent demand to assume, so a
     level above the bound is not extrapolation and must not be silently capped.
     """
-    if cfg.aggregate_elasticity == 0.0 or anchor_price <= 0 or price_signal <= 0:
-        return float(cfg.demand_level), False
+    if scenario.aggregate_elasticity == 0.0 or anchor_price <= 0 or price_signal <= 0:
+        return float(scenario.demand_level), False
     low, high = cfg.demand_multiplier_bounds
-    response = (price_signal / anchor_price) ** -cfg.aggregate_elasticity
+    response = (price_signal / anchor_price) ** -scenario.aggregate_elasticity
     clamped = min(max(response, low), high)
-    return float(cfg.demand_level * clamped), bool(clamped != response)
+    return float(scenario.demand_level * clamped), bool(clamped != response)
 
 
 def sample_arrivals(

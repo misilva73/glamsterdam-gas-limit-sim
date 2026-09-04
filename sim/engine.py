@@ -1,11 +1,11 @@
 """The per-step simulation loop: fee update, gas-limit ramp, and block fill.
 
-The mempool is parallel numpy arrays kept in inclusion-tiebreak order
-(`schemas.INCLUSION_TIEBREAK_COLUMNS`). That invariant is what makes the hot
-path affordable: arrivals only ever append (their `arrival_step` is the largest
-so far, and `sample_arrivals` emits `(source_block_number, tx_index,
-replica_index)` order within a step) and removals preserve relative order, so the
-full tie-break chain reduces to a *stable* sort on the tip alone.
+The mempool is parallel numpy arrays kept in inclusion-tiebreak order. That
+invariant is what makes the hot path affordable: arrivals only ever append (their
+arrival step is the largest so far, and `sample_arrivals` emits
+`(source_block_number, tx_index, replica_index)` order within a step) and removals
+preserve relative order, so the full tie-break chain reduces to a *stable* sort
+on the tip alone.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from config import MAX_BASE_FEE, SimConfig
+from config import MAX_BASE_FEE, Scenario, SimConfig
 from schemas import PER_STEP_COLUMNS
 from sim.metrics import (
     BACKLOG_COLUMNS,
@@ -53,13 +53,14 @@ TIP_TRANCHE_SIZE = 16_384
 # more time copying; higher ones spend more time scanning dead entries.
 COMPACTION_DEAD_SHARE = 0.25
 
-_IDENTITY_INTEGERS = ("source_block_number", "window_instance", "position_in_window")
+_IDENTITY_INTEGERS = ("source_block_number",)
 
 
 def run_path(
     cohorts: Cohorts,
     path: pd.DataFrame,
     cfg: SimConfig,
+    scenario: Scenario,
     *,
     run_index: int,
     starting_base_fee: int,
@@ -83,15 +84,10 @@ def run_path(
     the price signal as it stood before this block was built, and the signal is
     updated from the block's own outcome only afterwards.
     """
-    _require_anchors(cohorts, cfg)
     rng = demand_rng(cfg, run_index)
     cohort_index = path["cohort_index"].to_numpy(np.int64)
     source_block_number = path["source_block_number"].to_numpy(np.int64)
-    window_instance = path["window_instance"].to_numpy(np.int64)
-    position_in_window = path["position_in_window"].to_numpy(np.int64)
-    pool_low, pool_high = demand_pool_bounds(
-        cohorts, path, cfg.bootstrap_window_blocks, cfg.arrival_mode
-    )
+    pool_low, pool_high = demand_pool_bounds(cohorts, path)
 
     pool = Mempool()
     base_fee = int(starting_base_fee)
@@ -100,11 +96,11 @@ def run_path(
     backlog_execution_gas = backlog_state_gas = 0
     # Seeding the signal at the first cohort's own anchor makes step 0's
     # multiplier exactly `demand_level`, whatever `starting_base_fee` is: the
-    # reference path begins at its anchor by construction. The tip estimate is
+    # sampled path begins at its first cohort's anchor. The tip estimate is
     # seeded from the same cohort, so an empty first block does not drag the
     # signal toward a tipless price it never actually saw.
-    anchor_price = _anchor_prices(cohorts, cohort_index)
-    price_signal = float(anchor_price[0]) if anchor_price is not None else float(base_fee)
+    anchor_price = cohorts.anchor_price[cohort_index]
+    price_signal = float(anchor_price[0]) if cohort_index.size else float(base_fee)
     prevailing_tip = _seed_tip(cohorts, cohort_index)
 
     records = []
@@ -116,10 +112,10 @@ def run_path(
             base_fee = next_base_fee(base_fee, parent_gas_used, gas_limit)
             gas_limit = ramp_gas_limit(gas_limit, cfg.glamsterdam_gas_limit)
 
-        cohort_anchor = (
-            float(anchor_price[position]) if anchor_price is not None else float(base_fee)
+        cohort_anchor = float(anchor_price[position])
+        multiplier, clamped = demand_multiplier(
+            cfg, scenario, price_signal, cohort_anchor
         )
-        multiplier, clamped = demand_multiplier(cfg, price_signal, cohort_anchor)
         arrivals = sample_arrivals(
             cohorts,
             int(cohort_index[position]),
@@ -146,12 +142,10 @@ def run_path(
 
         records.append(
             step_record(
-                cfg,
+                scenario,
                 run_index=run_index,
                 simulation_position=position,
                 source_block_number=int(source_block_number[position]),
-                window_instance=int(window_instance[position]),
-                position_in_window=int(position_in_window[position]),
                 demand_price_signal=price_signal,
                 cohort_anchor_price=cohort_anchor,
                 realized_demand_multiplier=multiplier,
@@ -176,37 +170,9 @@ def run_path(
     return _per_step_frame(records)
 
 
-def _require_anchors(cohorts: Cohorts, cfg: SimConfig) -> None:
-    """Both price-responsive features need the price the cohort was observed at."""
-    if cohorts.has_anchors:
-        return
-    needs = [
-        name
-        for name, active in (
-            ("aggregate_elasticity", cfg.aggregate_elasticity != 0.0),
-            ("adapt_bids", cfg.adapt_bids),
-        )
-        if active
-    ]
-    if needs:
-        raise ValueError(
-            f"{' and '.join(needs)} cannot run without per-cohort anchor prices, which "
-            "come from the block headers passed to build_cohorts(tx_frame, headers). "
-            "Either supply headers, or set aggregate_elasticity=0 and adapt_bids=False "
-            "for a flat demand multiplier with frozen fee caps."
-        )
-
-
-def _anchor_prices(cohorts: Cohorts, cohort_index: np.ndarray) -> np.ndarray | None:
-    """Anchor price per simulation position, or None when no headers were given."""
-    if not cohorts.has_anchors or cohort_index.size == 0:
-        return None
-    return cohorts.anchor_price[cohort_index]
-
-
 def _seed_tip(cohorts: Cohorts, cohort_index: np.ndarray) -> float:
     """The first cohort's realised mean tip, or 0 when there is nothing to go on."""
-    if cohorts.anchor_tip is None or cohort_index.size == 0:
+    if cohort_index.size == 0:
         return 0.0
     return float(cohorts.anchor_tip[cohort_index[0]])
 
@@ -328,13 +294,10 @@ def fill_and_measure(
     backlog = {
         "backlog_tx_count": pool.live_count() - chosen.size,
         "backlog_eligible_tx_count": candidates.size - chosen.size,
-        "backlog_fee_ineligible_tx_count": pool.live_count() - candidates.size,
         "backlog_execution_gas": pool_execution_gas - block_execution_gas_used,
         "backlog_state_gas": pool_state_gas - block_state_gas_used,
         "backlog_eligible_execution_gas": eligible_execution_gas - block_execution_gas_used,
         "backlog_eligible_state_gas": eligible_state_gas - block_state_gas_used,
-        "backlog_fee_ineligible_execution_gas": pool_execution_gas - eligible_execution_gas,
-        "backlog_fee_ineligible_state_gas": pool_state_gas - eligible_state_gas,
     }
     metrics = {
         "block_execution_gas_used": block_execution_gas_used,

@@ -2,12 +2,11 @@
 """Run a Fusaka -> Glamsterdam gas-limit simulation end to end.
 
 Sweeps the elasticity x demand-level x bootstrap-window grid, runs
-`num_bootstrap_runs` independent moving-block-bootstrap paths plus one matching
-historical reference path per cell, and writes the per-step data, the scenario
-summaries, and a run manifest.
+`num_bootstrap_runs` independent moving-block-bootstrap paths per cell, and
+writes the per-step data, the scenario summaries, and a run manifest.
 
 Output is **checkpointed per grid cell**: when a cell finishes, its paths go to
-`per_step/<cell>_<mode>.parquet` and its summary rows are appended to
+`per_step/<cell>.parquet` and its summary row is appended to
 `scenario_summary.csv` before the next cell starts. Nothing but the cell in
 flight is held in memory, so a whole sweep fits in one process and a crash at
 hour nine costs one cell rather than everything. Every invocation writes into a
@@ -15,13 +14,13 @@ fresh timestamped directory under `output_dir`, so runs never mix -- unless
 `--resume STAMP` names an interrupted one, in which case the cells it already
 checkpointed are skipped and the rest are simulated into the same directory.
 
-It does no analysis and draws no figures. The job here is to produce data;
-reading it belongs in `notebooks/`.
+It does no analysis and draws no figures. The job here is to produce data for a
+separate downstream analysis.
 
 Every path in a scenario starts from the identical initial state: empty mempool,
-the base fee of the actual parent of `reference_start_block`, and
-`fusaka_gas_limit`. Per-run randomness is derived from `random_seed`, so runs
-are independent and the whole simulation is reproducible.
+the base fee of the actual parent of the first source cohort, and
+`fusaka_gas_limit`. Per-run randomness is derived from `random_seed`, so runs are
+independent and the whole simulation is reproducible.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from config import DEFAULT_CONFIG, SimConfig, SimulationGrid
+from config import DEFAULT_CONFIG, Scenario, SimConfig, SimulationGrid
 from data.fetch_blocks import fetch_block_headers, starting_base_fee
 from data.load_tx_gas_results import (
     derive_gas_dimensions,
@@ -48,13 +47,7 @@ from data.load_tx_gas_results import (
 )
 from schemas import PER_STEP_COLUMNS
 from sim.engine import run_path
-from sim.workload import bootstrap_path, bootstrap_rng, build_cohorts, historical_path
-
-BOOTSTRAP_MODE = "moving_block_bootstrap"
-HISTORICAL_MODE = "historical"
-
-ARRIVAL_MODE_SLUGS = {BOOTSTRAP_MODE: "bootstrap", HISTORICAL_MODE: "historical"}
-"""Short tokens for part-file names; the column itself keeps the full mode name."""
+from sim.workload import bootstrap_path, bootstrap_rng, build_cohorts
 
 PER_STEP_DIR = "per_step"
 SUMMARY_FILE = "scenario_summary.csv"
@@ -119,23 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="inclusive source block range",
     )
     source.add_argument(
-        "--reference-start-block",
-        type=int,
-        help="first block of the historical path; its parent sets the starting base "
-        "fee (default: first block of the range)",
-    )
-    source.add_argument(
         "--cache-dir", type=Path, help="parquet cache for fetched data (default: data/cache)"
     )
 
     sim = parser.add_argument_group("simulation")
     sim.add_argument("--horizon", type=int, help="arrival steps (default: trace length)")
-    sim.add_argument(
-        "--arrival-mode",
-        choices=(HISTORICAL_MODE, BOOTSTRAP_MODE),
-        help="historical replays the trace once, with no bands; "
-        "moving_block_bootstrap resamples cohort windows (default)",
-    )
     sim.add_argument(
         "--num-runs", type=int, help="bootstrap paths per grid cell (default: 20)"
     )
@@ -205,14 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         metavar="L",
         help="bootstrap axis: length in cohorts of each resampled window "
-        "(default: 16 32 64)",
+        "(default: 32; pass multiple values for a robustness sweep)",
     )
-    grid.add_argument(
-        "--no-historical",
-        action="store_true",
-        help="skip the historical reference path (bands only)",
-    )
-
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -231,19 +206,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_config(args: argparse.Namespace, base: SimConfig = DEFAULT_CONFIG) -> SimConfig:
     """Resolve CLI overrides into a `SimConfig`. Pure, so it is directly testable."""
-    windows = args.window_blocks or None
-    elasticities = args.elasticities or None
-    levels = args.demand_levels or None
     overrides = {
         "analysis_config_hash": args.analysis_config_hash,
         "schedule_name": args.schedule_name,
         "schedule_config_hash": args.schedule_config_hash,
         "chain_id": args.chain_id,
         "source_block_range": tuple(args.block_range) if args.block_range else None,
-        "reference_start_block": args.reference_start_block,
         "cache_dir": args.cache_dir,
         "simulation_horizon_blocks": args.horizon,
-        "arrival_mode": args.arrival_mode,
         "num_bootstrap_runs": args.num_runs,
         "random_seed": args.seed,
         "starting_base_fee": args.starting_base_fee,
@@ -255,11 +225,6 @@ def build_config(args: argparse.Namespace, base: SimConfig = DEFAULT_CONFIG) -> 
             tuple(args.multiplier_bounds) if args.multiplier_bounds else None
         ),
         "adapt_bids": False if args.no_bid_adaptation else None,
-        # The grid drives the sweep; the config carries its first cell so that a
-        # single-scenario config is always self-consistent.
-        "bootstrap_window_blocks": windows[0] if windows else None,
-        "aggregate_elasticity": elasticities[0] if elasticities else None,
-        "demand_level": levels[0] if levels else None,
     }
     return base.with_(**{k: v for k, v in overrides.items() if v is not None})
 
@@ -269,7 +234,6 @@ def build_grid(args: argparse.Namespace, base: SimulationGrid = SimulationGrid()
         "aggregate_elasticities": tuple(args.elasticities) if args.elasticities else None,
         "demand_levels": tuple(args.demand_levels) if args.demand_levels else None,
         "bootstrap_window_blocks": tuple(args.window_blocks) if args.window_blocks else None,
-        "include_historical_reference": False if args.no_historical else None,
     }
     return SimulationGrid(
         **{**asdict(base), **{k: v for k, v in overrides.items() if v is not None}}
@@ -300,10 +264,9 @@ def run_simulation(
     timings: dict[str, float] = {}
     started = time.perf_counter()
     cells = grid_cells(grid)
-    modes = cell_arrival_modes(cfg, grid)
     # Checked before the load, which is the expensive part: an incompatible
     # --resume should fail in milliseconds, not after a 500-second fetch.
-    resumed = open_resumed_run(cfg, grid, resume, cells, modes) if resume else None
+    resumed = open_resumed_run(cfg, grid, resume, cells) if resume else None
 
     with _timed(timings, "load_seconds"):
         # Every replay row is demand; the outcome breakdown is a report on what
@@ -343,24 +306,27 @@ def run_simulation(
         ),
     )
 
-    for cell in cells[done:]:
-        elasticity, level, window = cell
-        cell_cfg = cfg.with_(
-            aggregate_elasticity=elasticity,
-            demand_level=level,
-            bootstrap_window_blocks=window,
-        )
+    for scenario in cells[done:]:
         with _timed(timings, "simulate_seconds"):
             frames = run_scenario(
                 cohorts,
-                cell_cfg,
+                cfg,
+                scenario,
                 horizon=horizon,
                 base_fee=base_fee,
-                include_historical=grid.include_historical_reference,
             )
         with _timed(timings, "write_seconds"):
             summaries.append(
-                checkpoint_cell(per_step_dir, summary_path, cell_slug(*cell), modes, frames)
+                checkpoint_cell(
+                    per_step_dir,
+                    summary_path,
+                    cell_slug(
+                        scenario.aggregate_elasticity,
+                        scenario.demand_level,
+                        scenario.bootstrap_window_blocks,
+                    ),
+                    frames,
+                )
             )
         # Drop the cell before the next one is simulated: keeping the binding
         # alive would hold two cells at the peak instead of one.
@@ -376,14 +342,14 @@ def run_simulation(
     return SimulationResult(run_dir, outcomes, summary, manifest, outputs + [manifest_path])
 
 
-def grid_cells(grid: SimulationGrid) -> list[tuple[float, float, int]]:
+def grid_cells(grid: SimulationGrid) -> list[Scenario]:
     """Every cell of the sweep, in the order it is simulated and written.
 
     `--resume` depends on this order being stable: cells are checkpointed
     sequentially, so what is on disk is always a prefix of this list.
     """
     cells = [
-        (elasticity, level, window)
+        Scenario(elasticity, level, window)
         for elasticity in grid.aggregate_elasticities
         for level in grid.demand_levels
         for window in grid.bootstrap_window_blocks
@@ -393,102 +359,55 @@ def grid_cells(grid: SimulationGrid) -> list[tuple[float, float, int]]:
     return cells
 
 
-def cell_arrival_modes(cfg: SimConfig, grid: SimulationGrid) -> tuple[str, ...]:
-    """The arrival modes every cell writes: one part file and one summary row each.
-
-    Fixed for the whole sweep, which is what lets `--resume` tell a finished cell
-    from an interrupted one by counting files and rows.
-    """
-    if cfg.arrival_mode == HISTORICAL_MODE:
-        return (HISTORICAL_MODE,)
-    modes = (BOOTSTRAP_MODE,) if cfg.num_bootstrap_runs > 0 else ()
-    if grid.include_historical_reference:
-        modes += (HISTORICAL_MODE,)
-    if not modes:
-        raise ValueError(
-            "nothing to simulate: --num-runs 0 leaves only the historical "
-            "reference, which --no-historical then skips"
-        )
-    return modes
-
-
 def run_scenario(
     cohorts,
     cfg: SimConfig,
+    scenario: Scenario,
     *,
     horizon: int,
     base_fee: int,
-    include_historical: bool = True,
 ) -> list[pd.DataFrame]:
-    """One grid cell: `num_bootstrap_runs` bootstrap paths plus the reference.
-
-    `cfg.arrival_mode == "historical"` runs the reference path alone, for a
-    single-trace replay with no Monte Carlo bands.
-    """
-    historical_only = cfg.arrival_mode == HISTORICAL_MODE
-    bootstrap_cfg = cfg.with_(arrival_mode=BOOTSTRAP_MODE)
-    num_runs = 0 if historical_only else cfg.num_bootstrap_runs
-    frames = [
-        _tag(
-            run_path(
+    """Run the bootstrap samples for one grid cell."""
+    return [
+        run_path(
+            cohorts,
+            # Common random numbers: the same window draw serves every
+            # demand scenario, so scenarios differ by demand alone.
+            bootstrap_path(
                 cohorts,
-                # Common random numbers: the same window draw serves every
-                # demand scenario, so scenarios differ by demand alone.
-                bootstrap_path(
-                    cohorts,
-                    horizon,
-                    cfg.bootstrap_window_blocks,
-                    bootstrap_rng(cfg, run_index),
-                ),
-                bootstrap_cfg,
-                run_index=run_index,
-                starting_base_fee=base_fee,
+                horizon,
+                scenario.bootstrap_window_blocks,
+                bootstrap_rng(cfg, run_index),
             ),
-            bootstrap_cfg,
-            run_index,
+            cfg,
+            scenario,
+            run_index=run_index,
+            starting_base_fee=base_fee,
         )
-        for run_index in range(num_runs)
+        for run_index in range(cfg.num_bootstrap_runs)
     ]
-    if include_historical or historical_only:
-        historical_cfg = cfg.with_(arrival_mode=HISTORICAL_MODE)
-        frames.append(
-            _tag(
-                run_path(
-                    cohorts,
-                    historical_path(cohorts, horizon),
-                    historical_cfg,
-                    run_index=0,
-                    starting_base_fee=base_fee,
-                ),
-                historical_cfg,
-                run_index=0,
-            )
-        )
-    return frames
 
 
 def fetch_headers(cfg: SimConfig, simulatable: pd.DataFrame) -> pd.DataFrame:
-    """Headers covering every source block, plus the reference path's parent.
+    """Headers covering every source block, plus the first cohort's parent.
 
     Every cohort needs its own block's base fee for the demand anchor, and the
-    reference path additionally needs the block *before* its first, whose base
-    fee is where the simulation starts.
+    simulation additionally needs the block *before* its first cohort, whose
+    base fee is where every path starts.
     """
     blocks = simulatable["block_number"].to_numpy(np.int64)
-    first = min(int(cfg.reference_start_block or blocks.min()), int(blocks.min()))
+    first = int(blocks.min())
     return fetch_block_headers(cfg, first - 1, int(blocks.max()))
 
 
 def resolve_starting_base_fee(
     cfg: SimConfig, headers: pd.DataFrame, simulatable: pd.DataFrame
 ) -> int:
-    """Base fee of the parent of `reference_start_block`, or the configured override."""
+    """Base fee of the first source cohort's parent, or the configured override."""
     if cfg.starting_base_fee is not None:
         return int(cfg.starting_base_fee)
-    reference = int(
-        cfg.reference_start_block or simulatable["block_number"].to_numpy(np.int64).min()
-    )
-    return starting_base_fee(headers, reference)
+    first_cohort = int(simulatable["block_number"].to_numpy(np.int64).min())
+    return starting_base_fee(headers, first_cohort)
 
 
 def scenario_summary(per_step: pd.DataFrame) -> pd.DataFrame:
@@ -496,10 +415,16 @@ def scenario_summary(per_step: pd.DataFrame) -> pd.DataFrame:
 
     "Terminal" is the last arrival step, which is where a path now ends.
     """
-    keys = ["arrival_mode", "aggregate_elasticity", "demand_level", "bootstrap_window_blocks"]
+    keys = ["aggregate_elasticity", "demand_level", "bootstrap_window_blocks"]
     flagged = per_step.assign(
-        execution_saturated=per_step["execution_utilization"] >= SATURATION_THRESHOLD,
-        state_saturated=per_step["state_utilization"] >= SATURATION_THRESHOLD,
+        execution_saturated=(
+            per_step["block_execution_gas_used"] / per_step["gas_limit"]
+            >= SATURATION_THRESHOLD
+        ),
+        state_saturated=(
+            per_step["block_state_gas_used"] / per_step["gas_limit"]
+            >= SATURATION_THRESHOLD
+        ),
     )
     saturation = flagged.groupby(keys, observed=True).agg(
         execution_saturated_share=("execution_saturated", "mean"),
@@ -557,13 +482,12 @@ def checkpoint_cell(
     per_step_dir: Path,
     summary_path: Path,
     slug: str,
-    modes: tuple[str, ...],
     frames: list[pd.DataFrame],
 ) -> pd.DataFrame:
-    """Persist one finished grid cell: its per-step parts, then its summary rows.
+    """Persist one finished grid cell: its per-step part, then its summary row.
 
-    One parquet per (cell x arrival mode) holding every run of that cell, and one
-    appended `scenario_summary.csv` row per part. Data is written before the
+    One parquet holds every bootstrap run of the cell, with one appended
+    `scenario_summary.csv` row. Data is written before the
     summary that describes it, so an interrupted sweep never leaves a summary row
     without the per-step data behind it -- and `--resume` can therefore trust that
     a summary row means a complete cell.
@@ -573,20 +497,9 @@ def checkpoint_cell(
     Int64/int64 distinction goes), so it cost real wall clock while being the
     worse copy. The small summaries stay CSV because they are meant to be read.
     """
-    by_mode = _by_arrival_mode(frames)
-    assert tuple(by_mode) == modes, (
-        f"cell wrote {tuple(by_mode)} but the sweep declared {modes}; resume "
-        "counts files and rows per cell, so the two must not drift"
-    )
-
-    summaries = []
-    for mode, frame in by_mode.items():
-        frame.to_parquet(per_step_dir / part_file(slug, mode), index=False)
-        # One mode at a time: `scenario_summary` groups by arrival mode anyway, so
-        # this yields the same rows without concatenating the cell a second time.
-        summaries.append(scenario_summary(frame))
-
-    summary = pd.concat(summaries, ignore_index=True)
+    frame = pd.concat(frames, ignore_index=True)[list(PER_STEP_COLUMNS)]
+    frame.to_parquet(per_step_dir / part_file(slug), index=False)
+    summary = scenario_summary(frame)
     first_cell = not summary_path.exists()
     summary.to_csv(
         summary_path, mode="w" if first_cell else "a", header=first_cell, index=False
@@ -603,8 +516,8 @@ def cell_slug(elasticity: float, level: float, window: int) -> str:
     return f"e{float(elasticity)!r}_d{float(level)!r}_w{int(window)}"
 
 
-def part_file(slug: str, mode: str) -> str:
-    return f"{slug}_{ARRIVAL_MODE_SLUGS[mode]}.parquet"
+def part_file(slug: str) -> str:
+    return f"{slug}.parquet"
 
 
 def write_replay_outcomes(run_dir: Path, outcomes: pd.DataFrame) -> Path:
@@ -641,8 +554,7 @@ def open_resumed_run(
     cfg: SimConfig,
     grid: SimulationGrid,
     resume: str,
-    cells: list[tuple[float, float, int]],
-    modes: tuple[str, ...],
+    cells: list[Scenario],
 ) -> ResumedRun:
     """Validate `--resume STAMP` and work out where the sweep stopped.
 
@@ -673,13 +585,11 @@ def open_resumed_run(
             "output directory"
         )
 
-    cells_done, summary = completed_cells(run_dir, cells, modes)
+    cells_done, summary = completed_cells(run_dir, cells)
     return ResumedRun(run_dir, cells_done, summary, prior)
 
 
-def completed_cells(
-    run_dir: Path, cells: list[tuple[float, float, int]], modes: tuple[str, ...]
-) -> tuple[int, pd.DataFrame]:
+def completed_cells(run_dir: Path, cells: list[Scenario]) -> tuple[int, pd.DataFrame]:
     """How many leading cells are fully checkpointed, and their summary rows.
 
     Cells are simulated in `grid_cells` order, so what is on disk is a prefix and
@@ -690,16 +600,20 @@ def completed_cells(
     """
     per_step_dir = run_dir / PER_STEP_DIR
     written = 0
-    for cell in cells:
-        slug = cell_slug(*cell)
-        if not all((per_step_dir / part_file(slug, mode)).exists() for mode in modes):
+    for scenario in cells:
+        slug = cell_slug(
+            scenario.aggregate_elasticity,
+            scenario.demand_level,
+            scenario.bootstrap_window_blocks,
+        )
+        if not (per_step_dir / part_file(slug)).exists():
             break
         written += 1
 
     summary_path = run_dir / SUMMARY_FILE
     rows = pd.read_csv(summary_path) if summary_path.exists() else pd.DataFrame()
-    cells_done = min(written, len(rows) // len(modes))
-    kept = rows.iloc[: cells_done * len(modes)]
+    cells_done = min(written, len(rows))
+    kept = rows.iloc[:cells_done]
     if len(kept) != len(rows):
         if kept.empty:
             # Leave no header behind: the next checkpoint writes the file fresh.
@@ -722,8 +636,13 @@ def resume_mismatches(prior: dict, cfg: SimConfig, grid: SimulationGrid) -> list
         for name, value in current.items()
         if name not in RESUME_EXEMPT_CONFIG_FIELDS and stored.get(name) != value
     ]
+    extra_stored = set(stored) - set(current) - RESUME_EXEMPT_CONFIG_FIELDS
+    if extra_stored:
+        mismatched.append("config schema")
     if prior.get("grid") != _jsonable(asdict(grid)):
         mismatched.append("grid")
+    if prior.get("per_step_columns") != list(PER_STEP_COLUMNS):
+        mismatched.append("per-step schema")
     return mismatched
 
 
@@ -780,6 +699,7 @@ def run_manifest(
         "completed": completed,
         "config": manifest_config(cfg),
         "grid": asdict(grid),
+        "per_step_columns": list(PER_STEP_COLUMNS),
         # `config.output_dir` is the parent; `run_dir` is where the run wrote.
         "resolved": {"run_dir": str(run_dir)} | resolved,
         "library_versions": library_versions(),
@@ -823,36 +743,9 @@ def main(argv: list[str] | None = None) -> int:
 # --- internals --------------------------------------------------------------
 
 
-def _tag(per_step: pd.DataFrame, cfg: SimConfig, run_index: int) -> pd.DataFrame:
-    """Stamp the grid identity, so a concatenated simulation is always groupable."""
-    return per_step.assign(
-        arrival_mode=cfg.arrival_mode,
-        run_index=run_index,
-        aggregate_elasticity=cfg.aggregate_elasticity,
-        demand_level=cfg.demand_level,
-        bootstrap_window_blocks=cfg.bootstrap_window_blocks,
-    )
-
-
 def _jsonable(value: dict) -> dict:
     """Round-trip through JSON so tuples compare equal to the lists on disk."""
     return json.loads(json.dumps(value, default=str))
-
-
-def _by_arrival_mode(frames: list[pd.DataFrame]) -> dict[str, pd.DataFrame]:
-    """A cell's paths concatenated per arrival mode, in the order they ran.
-
-    Reindexing to `PER_STEP_COLUMNS` is what lets the part files be read back as
-    one dataset: pyarrow requires every part to share a schema, and a column order
-    that drifted between cells would break the directory read rather than one file.
-    """
-    grouped: dict[str, list[pd.DataFrame]] = {}
-    for frame in frames:
-        grouped.setdefault(str(frame["arrival_mode"].iloc[0]), []).append(frame)
-    return {
-        mode: pd.concat(group, ignore_index=True)[list(PER_STEP_COLUMNS)]
-        for mode, group in grouped.items()
-    }
 
 
 @contextmanager

@@ -17,27 +17,19 @@ from config import (
     LEGACY_TX_TYPES,
     MAX_BASE_FEE,
     MIN_BASE_FEE,
-    SimConfig,
+    Scenario,
 )
-from schemas import (
-    BOTTLENECK_EXECUTION,
-    BOTTLENECK_NONE,
-    BOTTLENECK_STATE,
-    PER_STEP_COLUMNS,
-)
+from schemas import PER_STEP_COLUMNS
 
 _LEGACY_TX_TYPES = np.array(sorted(LEGACY_TX_TYPES), np.int64)
 
 BACKLOG_COLUMNS = (
     "backlog_tx_count",
     "backlog_eligible_tx_count",
-    "backlog_fee_ineligible_tx_count",
     "backlog_execution_gas",
     "backlog_state_gas",
     "backlog_eligible_execution_gas",
     "backlog_eligible_state_gas",
-    "backlog_fee_ineligible_execution_gas",
-    "backlog_fee_ineligible_state_gas",
 )
 
 
@@ -137,23 +129,12 @@ def tip_given_legacy_mask(is_legacy, max_fee_per_gas, max_priority_fee_per_gas, 
     return np.where(is_legacy, headroom, np.minimum(max_priority_fee_per_gas, headroom))
 
 
-def bottleneck_dimension(block_execution_gas_used: int, block_state_gas_used: int) -> str:
-    """Which dimension bound the block; both share one limit, so compare raw gas."""
-    if block_execution_gas_used == 0 and block_state_gas_used == 0:
-        return BOTTLENECK_NONE
-    if block_state_gas_used > block_execution_gas_used:
-        return BOTTLENECK_STATE
-    return BOTTLENECK_EXECUTION
-
-
 def step_record(
-    cfg: SimConfig,
+    scenario: Scenario,
     *,
     run_index: int,
     simulation_position: int,
     source_block_number: int,
-    window_instance: int,
-    position_in_window: int,
     demand_price_signal: float,
     cohort_anchor_price: float,
     realized_demand_multiplier: float,
@@ -173,15 +154,12 @@ def step_record(
 ) -> dict:
     """One `schemas.PER_STEP_COLUMNS` row."""
     record = {
-        "arrival_mode": cfg.arrival_mode,
         "run_index": run_index,
-        "aggregate_elasticity": cfg.aggregate_elasticity,
-        "demand_level": cfg.demand_level,
-        "bootstrap_window_blocks": cfg.bootstrap_window_blocks,
+        "aggregate_elasticity": scenario.aggregate_elasticity,
+        "demand_level": scenario.demand_level,
+        "bootstrap_window_blocks": scenario.bootstrap_window_blocks,
         "simulation_position": simulation_position,
         "source_block_number": source_block_number,
-        "window_instance": window_instance,
-        "position_in_window": position_in_window,
         "demand_price_signal": demand_price_signal,
         "cohort_anchor_price": cohort_anchor_price,
         "realized_demand_multiplier": realized_demand_multiplier,
@@ -189,16 +167,8 @@ def step_record(
         "base_fee_per_gas": base_fee_per_gas,
         "base_fee_clamped": base_fee_clamped,
         "gas_limit": gas_limit,
-        # Header-equivalent: the two dimensions share one limit, so the block's
-        # gas used is the larger of them, and that is the EIP-1559 parent input.
-        "gas_used": max(block_execution_gas_used, block_state_gas_used),
         "block_execution_gas_used": block_execution_gas_used,
         "block_state_gas_used": block_state_gas_used,
-        "execution_utilization": block_execution_gas_used / gas_limit,
-        "state_utilization": block_state_gas_used / gas_limit,
-        "bottleneck_dimension": bottleneck_dimension(
-            block_execution_gas_used, block_state_gas_used
-        ),
         "included_tx_count": included_tx_count,
         "sender_gas_used": sender_gas_used,
         "priority_fees_wei": priority_fees_wei,

@@ -6,15 +6,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from config import DEFAULT_CONFIG, MAX_BASE_FEE, MIN_BASE_FEE, SimConfig
+from config import DEFAULT_CONFIG, MAX_BASE_FEE, MIN_BASE_FEE, Scenario, SimConfig
 from tests.dummy import dummy_tx_gas_results
-from schemas import (
-    BOTTLENECK_EXECUTION,
-    BOTTLENECK_NONE,
-    BOTTLENECK_STATE,
-    PER_STEP_COLUMNS,
-    PER_STEP_DEMAND_COLUMNS,
-)
+from schemas import PER_STEP_COLUMNS, PER_STEP_DEMAND_COLUMNS
 from sim.engine import fill_block, run_path, select_included
 from sim.metrics import (
     effective_tip,
@@ -24,10 +18,10 @@ from sim.metrics import (
     update_price_signal,
 )
 from sim.workload import (
+    PATH_COLUMNS,
     bootstrap_path,
     build_cohorts,
     demand_multiplier,
-    historical_path,
 )
 from tests.test_workload import anchored_cohorts, simulatable
 
@@ -53,31 +47,63 @@ def tx_frame(*rows: dict) -> pd.DataFrame:
 
 
 def mechanism_config(**overrides) -> SimConfig:
-    """A config with the demand model switched off.
+    """Fixed run controls with bid adaptation off for mechanism tests."""
+    return DEFAULT_CONFIG.with_(adapt_bids=False, **overrides)
 
-    `aggregate_elasticity=0` plus `adapt_bids=False` is exactly the behaviour
-    before the demand model existed: a flat multiplier and frozen fee caps. The
-    block-fill, protocol-arithmetic, and mempool tests below are about those
-    mechanisms, so they hold the demand side still and need no anchor prices.
-    The demand model has its own section at the end of this file.
-    """
-    return DEFAULT_CONFIG.with_(aggregate_elasticity=0.0, adapt_bids=False, **overrides)
+
+def scenario(**overrides) -> Scenario:
+    """Per-cell controls, flat at 1x unless a test says otherwise."""
+    return Scenario(
+        **{
+            "aggregate_elasticity": 0.0,
+            "demand_level": 1.0,
+            "bootstrap_window_blocks": 32,
+            **overrides,
+        }
+    )
 
 
 def fixed_limit_config(gas_limit: int, **overrides) -> SimConfig:
     """A config whose gas limit never moves, so a test can hand-pick capacity."""
     return mechanism_config(
-        arrival_mode="historical",
         fusaka_gas_limit=gas_limit,
         glamsterdam_gas_limit=gas_limit,
         **overrides,
     )
 
 
-def run(frame: pd.DataFrame, cfg: SimConfig, base_fee: int = 0) -> pd.DataFrame:
-    cohorts = build_cohorts(frame)
-    path = historical_path(cohorts, len(cohorts))
-    return run_path(cohorts, path, cfg, run_index=0, starting_base_fee=base_fee)
+def run(
+    frame: pd.DataFrame,
+    cfg: SimConfig,
+    base_fee: int = 0,
+    cell: Scenario | None = None,
+) -> pd.DataFrame:
+    cohorts = build_cohorts(frame, headers_for(frame, GWEI))
+    cell = cell or scenario()
+    path = sequential_bootstrap_path(cohorts, len(cohorts), cell.bootstrap_window_blocks)
+    return run_path(
+        cohorts,
+        path,
+        cfg,
+        cell,
+        run_index=0,
+        starting_base_fee=base_fee,
+    )
+
+
+def sequential_bootstrap_path(cohorts, horizon: int, window: int) -> pd.DataFrame:
+    """Deterministic bootstrap-shaped path for mechanism tests."""
+    position = np.arange(horizon, dtype=np.int64)
+    return pd.DataFrame(
+        {
+            "simulation_position": position,
+            "cohort_index": position,
+            "source_block_number": cohorts.block_numbers[position],
+            "window_instance": position // window,
+            "position_in_window": position % window,
+        },
+        columns=list(PATH_COLUMNS),
+    )
 
 
 # --- Protocol arithmetic ----------------------------------------------------------
@@ -163,13 +189,17 @@ def test_a_scenario_that_cannot_shed_demand_clamps_instead_of_overflowing():
         *[dict(block_number=100 + i) for i in range(20) for _ in range(4)]
     )
     cfg = priced_config(
-        aggregate_elasticity=0.0,
-        demand_level=2.0,
         adapt_bids=True,
         fusaka_gas_limit=100_000,
         glamsterdam_gas_limit=100_000,
     )
-    steps = run_priced(frame, cfg, anchor_base_fee=GWEI, base_fee=MAX_BASE_FEE // 2)
+    steps = run_priced(
+        frame,
+        cfg,
+        scenario(demand_level=2.0),
+        anchor_base_fee=GWEI,
+        base_fee=MAX_BASE_FEE // 2,
+    )
 
     assert steps["base_fee_per_gas"].max() == MAX_BASE_FEE
     assert steps["base_fee_clamped"].any()
@@ -190,8 +220,10 @@ def test_bid_adaptation_does_not_wrap_a_fee_cap_near_int64():
         dict(tx_type=0, max_fee_per_gas=2**63 - 1),  # legacy: shifted branch
         dict(tx_type=2, max_fee_per_gas=2**63 - 1),  # dynamic fee: scaled branch
     )
-    cfg = priced_config(aggregate_elasticity=0.0, demand_level=1.0, adapt_bids=True)
-    steps = run_priced(frame, cfg, anchor_base_fee=1, base_fee=MAX_BASE_FEE)
+    cfg = priced_config(adapt_bids=True)
+    steps = run_priced(
+        frame, cfg, scenario(), anchor_base_fee=1, base_fee=MAX_BASE_FEE
+    )
 
     # Both rows bid far above the base fee, so both are still eligible and land
     # in the block. A wrapped cap would drop the legacy row.
@@ -311,10 +343,6 @@ def test_state_bound_block_leaves_execution_gas_unused():
 
     assert step["block_state_gas_used"] == 1_000_000
     assert step["block_execution_gas_used"] == 100_000
-    assert step["gas_used"] == 1_000_000
-    assert step["bottleneck_dimension"] == BOTTLENECK_STATE
-    assert step["state_utilization"] == 1.0
-    assert step["execution_utilization"] == pytest.approx(0.1)
     assert step["included_tx_count"] == 10
 
 
@@ -324,19 +352,17 @@ def test_execution_bound_block_leaves_state_gas_unused():
 
     assert step["block_execution_gas_used"] == 1_000_000
     assert step["block_state_gas_used"] == 10_000
-    assert step["gas_used"] == 1_000_000
-    assert step["bottleneck_dimension"] == BOTTLENECK_EXECUTION
     assert step["included_tx_count"] == 10
 
 
-def test_empty_block_has_no_bottleneck():
+def test_fee_ineligible_transaction_leaves_an_empty_block():
     # Priced below the starting base fee, so nothing is includable.
     frame = tx_frame(dict(max_fee_per_gas=GWEI))
     step = run(frame, fixed_limit_config(1_000_000), base_fee=10 * GWEI).iloc[0]
 
     assert step["included_tx_count"] == 0
-    assert step["gas_used"] == 0
-    assert step["bottleneck_dimension"] == BOTTLENECK_NONE
+    assert step["block_execution_gas_used"] == 0
+    assert step["block_state_gas_used"] == 0
 
 
 def test_sender_gas_and_priority_fees_are_post_refund_amounts():
@@ -371,10 +397,18 @@ def test_fee_ineligible_demand_waits_for_the_base_fee_to_fall():
     cfg = fixed_limit_config(60_000_000)
     steps = run(frame, cfg, base_fee=100 * GWEI)
 
-    ineligible = steps["backlog_fee_ineligible_tx_count"].to_numpy()
-    assert ineligible[0] == 1
-    assert steps.loc[0, "backlog_fee_ineligible_execution_gas"] == 21_000
-    assert steps.loc[0, "backlog_fee_ineligible_state_gas"] == 5_000
+    ineligible = steps["backlog_tx_count"] - steps["backlog_eligible_tx_count"]
+    assert ineligible.iloc[0] == 1
+    assert (
+        steps.loc[0, "backlog_execution_gas"]
+        - steps.loc[0, "backlog_eligible_execution_gas"]
+        == 21_000
+    )
+    assert (
+        steps.loc[0, "backlog_state_gas"]
+        - steps.loc[0, "backlog_eligible_state_gas"]
+        == 5_000
+    )
     assert steps.loc[0, "backlog_eligible_tx_count"] == 0
 
     # Empty blocks decay the base fee 12.5% per block until the caps clear, and
@@ -383,7 +417,7 @@ def test_fee_ineligible_demand_waits_for_the_base_fee_to_fall():
     assert steps.loc[first, "base_fee_per_gas"] <= 50 * GWEI
     assert steps.loc[first - 1, "base_fee_per_gas"] > 50 * GWEI
     assert steps.loc[first, "included_tx_count"] == first + 1
-    assert (ineligible[first:] == 0).all()
+    assert (ineligible.iloc[first:] == 0).all()
 
 
 # --- Gas-limit trajectory ---------------------------------------------------------
@@ -392,7 +426,7 @@ def test_fee_ineligible_demand_waits_for_the_base_fee_to_fall():
 def test_the_gas_limit_ramps_from_the_first_non_initial_block():
     """Glamsterdam is always live from step 0; there is no activation step."""
     frame = tx_frame(*[dict(block_number=100 + i) for i in range(8)])
-    cfg = mechanism_config(arrival_mode="historical")
+    cfg = mechanism_config()
     limits = run(frame, cfg, base_fee=GWEI)["gas_limit"].tolist()
 
     # Position 0 reports the configured initial state; the ramp starts at 1.
@@ -405,7 +439,7 @@ def test_the_gas_limit_ramps_from_the_first_non_initial_block():
 
 def test_first_simulated_block_reports_the_configured_initial_state():
     frame = tx_frame(*[dict(block_number=100 + i) for i in range(4)])
-    cfg = mechanism_config(arrival_mode="historical")
+    cfg = mechanism_config()
     steps = run(frame, cfg, base_fee=7 * GWEI)
 
     assert steps.loc[0, "gas_limit"] == cfg.fusaka_gas_limit
@@ -475,23 +509,30 @@ def test_a_run_ends_with_the_last_arrival_and_discards_what_is_queued():
     assert steps.loc[0, "backlog_execution_gas"] == 1_600_000
     assert steps.loc[0, "backlog_eligible_execution_gas"] == 1_600_000
     assert steps.loc[0, "backlog_state_gas"] == 0
-    # Every step arrives a cohort now, so the identity columns are never null.
-    identity = ["source_block_number", "window_instance", "position_in_window"]
-    assert steps[identity].notna().all().all()
+    assert steps["source_block_number"].notna().all()
 
 
 @pytest.fixture(scope="module")
 def dummy_cohorts():
-    return build_cohorts(simulatable(dummy_tx_gas_results(num_blocks=80, seed=13)))
+    raw = dummy_tx_gas_results(num_blocks=80, seed=13)
+    return build_cohorts(simulatable(raw), headers_for(raw, 8 * GWEI))
 
 
 def test_same_seed_and_config_reproduce_an_identical_frame(dummy_cohorts):
-    cfg = mechanism_config(demand_level=1.5, bootstrap_window_blocks=16)
-    path = bootstrap_path(dummy_cohorts, 40, cfg.bootstrap_window_blocks, np.random.default_rng(4))
+    cfg, cell = mechanism_config(), scenario(demand_level=1.5, bootstrap_window_blocks=16)
+    path = bootstrap_path(
+        dummy_cohorts, 40, cell.bootstrap_window_blocks, np.random.default_rng(4)
+    )
 
-    first = run_path(dummy_cohorts, path, cfg, run_index=0, starting_base_fee=8 * GWEI)
-    second = run_path(dummy_cohorts, path, cfg, run_index=0, starting_base_fee=8 * GWEI)
-    other_run = run_path(dummy_cohorts, path, cfg, run_index=1, starting_base_fee=8 * GWEI)
+    execute = lambda index: run_path(
+        dummy_cohorts,
+        path,
+        cfg,
+        cell,
+        run_index=index,
+        starting_base_fee=8 * GWEI,
+    )
+    first, second, other_run = execute(0), execute(0), execute(1)
 
     pd.testing.assert_frame_equal(first, second)
     assert first.to_csv(index=False) == second.to_csv(index=False)
@@ -501,9 +542,17 @@ def test_same_seed_and_config_reproduce_an_identical_frame(dummy_cohorts):
 
 def test_backlog_gas_conserves_arrivals_minus_inclusions(dummy_cohorts):
     """Every gas unit that arrives is either included or still in the backlog."""
-    cfg = mechanism_config(arrival_mode="historical")
-    path = historical_path(dummy_cohorts, 40)
-    steps = run_path(dummy_cohorts, path, cfg, run_index=0, starting_base_fee=8 * GWEI)
+    cfg = mechanism_config()
+    cell = scenario()
+    path = sequential_bootstrap_path(dummy_cohorts, 40, cell.bootstrap_window_blocks)
+    steps = run_path(
+        dummy_cohorts,
+        path,
+        cfg,
+        cell,
+        run_index=0,
+        starting_base_fee=8 * GWEI,
+    )
 
     for dimension in ("execution_gas", "state_gas"):
         arrived = np.array(
@@ -517,9 +566,16 @@ def test_mempool_compaction_cadence_does_not_change_results(dummy_cohorts, monke
     """Tombstoning is an optimisation: when it is collected must not matter."""
     import sim.engine as engine
 
-    cfg = mechanism_config(demand_level=2.5, bootstrap_window_blocks=16)
+    cfg, cell = mechanism_config(), scenario(demand_level=2.5, bootstrap_window_blocks=16)
     path = bootstrap_path(dummy_cohorts, 60, 16, np.random.default_rng(5))
-    run = lambda: run_path(dummy_cohorts, path, cfg, run_index=0, starting_base_fee=8 * GWEI)
+    run = lambda: run_path(
+        dummy_cohorts,
+        path,
+        cfg,
+        cell,
+        run_index=0,
+        starting_base_fee=8 * GWEI,
+    )
 
     reference = run()
     for share in (0.0, 0.99):  # compact every block; never compact
@@ -528,26 +584,27 @@ def test_mempool_compaction_cadence_does_not_change_results(dummy_cohorts, monke
 
 
 def test_end_to_end_run_on_dummy_data(dummy_cohorts):
-    cfg = mechanism_config(demand_level=2.0, bootstrap_window_blocks=16)
-    path = bootstrap_path(dummy_cohorts, 60, cfg.bootstrap_window_blocks, np.random.default_rng(0))
-    steps = run_path(dummy_cohorts, path, cfg, run_index=3, starting_base_fee=8 * GWEI)
+    cfg, cell = mechanism_config(), scenario(demand_level=2.0, bootstrap_window_blocks=16)
+    path = bootstrap_path(
+        dummy_cohorts, 60, cell.bootstrap_window_blocks, np.random.default_rng(0)
+    )
+    steps = run_path(
+        dummy_cohorts,
+        path,
+        cfg,
+        cell,
+        run_index=3,
+        starting_base_fee=8 * GWEI,
+    )
 
     assert tuple(steps.columns) == PER_STEP_COLUMNS
     assert len(steps) == 60
     assert steps["simulation_position"].tolist() == list(range(60))
     assert (steps["run_index"] == 3).all()
-    assert (steps["arrival_mode"] == cfg.arrival_mode).all()
-    assert (steps["gas_used"] <= steps["gas_limit"]).all()
-    assert (
-        steps["gas_used"]
-        == np.maximum(steps["block_execution_gas_used"], steps["block_state_gas_used"])
-    ).all()
+    assert (steps["block_execution_gas_used"] <= steps["gas_limit"]).all()
+    assert (steps["block_state_gas_used"] <= steps["gas_limit"]).all()
     assert steps["included_tx_count"].sum() > 0
     assert steps["priority_fees_wei"].min() >= 0
-    assert (
-        steps["backlog_tx_count"]
-        == steps["backlog_eligible_tx_count"] + steps["backlog_fee_ineligible_tx_count"]
-    ).all()
     assert (steps["gas_limit"].diff().dropna() >= 0).all()
 
 
@@ -565,59 +622,38 @@ def headers_for(frame: pd.DataFrame, base_fee: int) -> pd.DataFrame:
 
 
 def run_priced(
-    frame: pd.DataFrame, cfg: SimConfig, *, anchor_base_fee: int, base_fee: int
+    frame: pd.DataFrame,
+    cfg: SimConfig,
+    cell: Scenario,
+    *,
+    anchor_base_fee: int,
+    base_fee: int,
 ) -> pd.DataFrame:
     cohorts = build_cohorts(frame, headers_for(frame, anchor_base_fee))
     return run_path(
         cohorts,
-        historical_path(cohorts, len(cohorts)),
+        sequential_bootstrap_path(cohorts, len(cohorts), cell.bootstrap_window_blocks),
         cfg,
+        cell,
         run_index=0,
         starting_base_fee=base_fee,
     )
 
 
 def priced_config(**overrides) -> SimConfig:
-    """A config with the demand model live, historical arrivals unless overridden."""
-    return DEFAULT_CONFIG.with_(**{"arrival_mode": "historical", **overrides})
-
-
-def test_a_price_responsive_config_refuses_cohorts_without_anchors(dummy_cohorts):
-    """Both features need the price the cohort was observed at, and say so."""
-    path = historical_path(dummy_cohorts, 5)
-    with pytest.raises(ValueError, match="aggregate_elasticity and adapt_bids cannot run without"):
-        run_path(
-            dummy_cohorts,
-            path,
-            priced_config(aggregate_elasticity=0.175, adapt_bids=True),
-            run_index=0,
-            starting_base_fee=GWEI,
-        )
-    with pytest.raises(ValueError, match="^adapt_bids cannot run without"):
-        run_path(
-            dummy_cohorts,
-            path,
-            priced_config(aggregate_elasticity=0.0, adapt_bids=True),
-            run_index=0,
-            starting_base_fee=GWEI,
-        )
-    # Neither feature on: the flat-multiplier mode needs no anchors.
-    run_path(
-        dummy_cohorts,
-        path,
-        priced_config(aggregate_elasticity=0.0, adapt_bids=False),
-        run_index=0,
-        starting_base_fee=GWEI,
-    )
+    """A config with the demand model live."""
+    return DEFAULT_CONFIG.with_(**overrides)
 
 
 def test_step_zero_sits_exactly_on_the_anchor_whatever_the_starting_base_fee():
     """The anchor fixed point: the price signal is seeded at the first anchor."""
     frame = tx_frame(*[dict(block_number=100 + i) for i in range(4)])
-    cfg = priced_config(aggregate_elasticity=0.28, demand_level=1.5)
+    cfg, cell = priced_config(), scenario(aggregate_elasticity=0.28, demand_level=1.5)
 
     for base_fee in (1, GWEI, 500 * GWEI):
-        steps = run_priced(frame, cfg, anchor_base_fee=10 * GWEI, base_fee=base_fee)
+        steps = run_priced(
+            frame, cfg, cell, anchor_base_fee=10 * GWEI, base_fee=base_fee
+        )
         assert steps.loc[0, "realized_demand_multiplier"] == pytest.approx(1.5)
         assert not steps.loc[0, "demand_multiplier_clamped"]
         # tip is min(1 gwei, 100 - 10) = 1 gwei, so the anchor price is 11 gwei.
@@ -628,21 +664,23 @@ def test_step_zero_sits_exactly_on_the_anchor_whatever_the_starting_base_fee():
 def test_the_engine_applies_the_multiplier_the_demand_model_specifies(dummy_cohorts):
     """Exact wiring check: every step's multiplier is the model's own answer."""
     priced = anchored_cohorts(num_blocks=40, seed=21)
-    cfg = priced_config(aggregate_elasticity=0.175, demand_level=1.2, price_ema_blocks=8)
-    steps = run_priced_cohorts(priced, cfg, base_fee=4 * GWEI)
+    cfg = priced_config(price_ema_blocks=8)
+    cell = scenario(aggregate_elasticity=0.175, demand_level=1.2)
+    steps = run_priced_cohorts(priced, cfg, cell, base_fee=4 * GWEI)
 
     expected = [
-        demand_multiplier(cfg, row.demand_price_signal, row.cohort_anchor_price)[0]
+        demand_multiplier(cfg, cell, row.demand_price_signal, row.cohort_anchor_price)[0]
         for row in steps.itertuples()
     ]
     assert steps["realized_demand_multiplier"].tolist() == pytest.approx(expected)
 
 
-def run_priced_cohorts(cohorts, cfg: SimConfig, *, base_fee: int):
+def run_priced_cohorts(cohorts, cfg: SimConfig, cell: Scenario, *, base_fee: int):
     return run_path(
         cohorts,
-        historical_path(cohorts, len(cohorts)),
+        sequential_bootstrap_path(cohorts, len(cohorts), cell.bootstrap_window_blocks),
         cfg,
+        cell,
         run_index=0,
         starting_base_fee=base_fee,
     )
@@ -650,8 +688,14 @@ def run_priced_cohorts(cohorts, cfg: SimConfig, *, base_fee: int):
 
 def test_the_price_signal_is_an_ema_of_the_effective_price_not_the_base_fee():
     frame = tx_frame(*[dict(block_number=100 + i) for i in range(12)])
-    cfg = priced_config(aggregate_elasticity=0.175, price_ema_blocks=4)
-    steps = run_priced(frame, cfg, anchor_base_fee=10 * GWEI, base_fee=200 * GWEI)
+    cfg = priced_config(price_ema_blocks=4)
+    steps = run_priced(
+        frame,
+        cfg,
+        scenario(aggregate_elasticity=0.175),
+        anchor_base_fee=10 * GWEI,
+        base_fee=200 * GWEI,
+    )
 
     signal = steps["demand_price_signal"].to_numpy()
     # Seeded at the anchor, then dragged a fraction of the way toward the much
@@ -679,8 +723,14 @@ def test_demand_shrinks_above_the_anchor_price_and_grows_below_it():
     then expands once the collapsing base fee drags it below.
     """
     frame = tx_frame(*[dict(block_number=100 + i) for i in range(60)])
-    cfg = priced_config(aggregate_elasticity=0.28, price_ema_blocks=3)
-    steps = run_priced(frame, cfg, anchor_base_fee=GWEI, base_fee=1_000 * GWEI)
+    cfg = priced_config(price_ema_blocks=3)
+    steps = run_priced(
+        frame,
+        cfg,
+        scenario(aggregate_elasticity=0.28),
+        anchor_base_fee=GWEI,
+        base_fee=1_000 * GWEI,
+    )
 
     multiplier = steps["realized_demand_multiplier"].to_numpy()
     signal = steps["demand_price_signal"].to_numpy()
@@ -698,15 +748,15 @@ def test_bid_adaptation_makes_a_cohort_includable_at_a_far_higher_base_fee():
     frame = tx_frame(
         dict(max_fee_per_gas=20 * GWEI, max_priority_fee_per_gas=GWEI, execution_gas=21_000)
     )
-    cfg = priced_config(aggregate_elasticity=0.0)
+    cfg, cell = priced_config(), scenario()
     kwargs = dict(anchor_base_fee=10 * GWEI, base_fee=100 * GWEI)
 
-    frozen = run_priced(frame, cfg.with_(adapt_bids=False), **kwargs)
-    adapted = run_priced(frame, cfg.with_(adapt_bids=True), **kwargs)
+    frozen = run_priced(frame, cfg.with_(adapt_bids=False), cell, **kwargs)
+    adapted = run_priced(frame, cfg.with_(adapt_bids=True), cell, **kwargs)
 
     # A 20 gwei cap is worthless at a 100 gwei base fee...
     assert frozen.loc[0, "included_tx_count"] == 0
-    assert frozen.loc[0, "backlog_fee_ineligible_tx_count"] == 1
+    assert frozen.loc[0, "backlog_tx_count"] - frozen.loc[0, "backlog_eligible_tx_count"] == 1
     # ...but the same 2x headroom over its own block's base fee is not.
     assert adapted.loc[0, "included_tx_count"] == 1
     assert adapted.loc[0, "priority_fees_wei"] == pytest.approx(GWEI * 21_000)
@@ -716,7 +766,7 @@ def test_every_step_records_a_drawn_demand_response():
     """With no drain phase there are no stepless-demand rows left to be null."""
     priced = anchored_cohorts(num_blocks=20, seed=31)
     steps = run_priced_cohorts(
-        priced, priced_config(aggregate_elasticity=0.175), base_fee=8 * GWEI
+        priced, priced_config(), scenario(aggregate_elasticity=0.175), base_fee=8 * GWEI
     )
 
     assert len(steps) == 20
@@ -728,10 +778,14 @@ def test_every_step_records_a_drawn_demand_response():
 
 def test_the_clamp_is_recorded_when_the_price_leaves_the_estimation_range():
     frame = tx_frame(*[dict(block_number=100 + i) for i in range(30)])
-    cfg = priced_config(
-        aggregate_elasticity=0.28, price_ema_blocks=2, demand_multiplier_bounds=(0.9, 1.1)
+    cfg = priced_config(price_ema_blocks=2, demand_multiplier_bounds=(0.9, 1.1))
+    steps = run_priced(
+        frame,
+        cfg,
+        scenario(aggregate_elasticity=0.28),
+        anchor_base_fee=GWEI,
+        base_fee=1_000 * GWEI,
     )
-    steps = run_priced(frame, cfg, anchor_base_fee=GWEI, base_fee=1_000 * GWEI)
 
     assert steps["demand_multiplier_clamped"].any()
     clamped = steps.loc[steps["demand_multiplier_clamped"], "realized_demand_multiplier"]
@@ -742,7 +796,7 @@ def test_arrived_gas_is_recorded_and_conserved_against_the_backlog():
     """Sampling makes arrivals unrecoverable from the path, so they are output."""
     priced = anchored_cohorts(num_blocks=40, seed=17)
     steps = run_priced_cohorts(
-        priced, priced_config(aggregate_elasticity=0.175), base_fee=8 * GWEI
+        priced, priced_config(), scenario(aggregate_elasticity=0.175), base_fee=8 * GWEI
     )
 
     for dimension in ("execution", "state"):
@@ -753,15 +807,20 @@ def test_arrived_gas_is_recorded_and_conserved_against_the_backlog():
 
 def test_the_demand_model_run_is_reproducible_and_run_dependent():
     priced = anchored_cohorts(num_blocks=60, seed=41)
-    cfg = priced_config(
-        arrival_mode="moving_block_bootstrap",
+    cfg = priced_config()
+    cell = scenario(
         aggregate_elasticity=0.175,
         demand_level=1.5,
         bootstrap_window_blocks=16,
     )
     path = bootstrap_path(priced, 40, 16, np.random.default_rng(4))
     run = lambda index: run_path(
-        priced, path, cfg, run_index=index, starting_base_fee=8 * GWEI
+        priced,
+        path,
+        cfg,
+        cell,
+        run_index=index,
+        starting_base_fee=8 * GWEI,
     )
 
     pd.testing.assert_frame_equal(run(0), run(0))
@@ -771,14 +830,21 @@ def test_the_demand_model_run_is_reproducible_and_run_dependent():
 
 def test_end_to_end_with_the_demand_model_on_dummy_data():
     priced = anchored_cohorts(num_blocks=80, seed=13)
-    cfg = priced_config(
-        arrival_mode="moving_block_bootstrap",
+    cfg = priced_config()
+    cell = scenario(
         aggregate_elasticity=0.175,
         demand_level=2.0,
         bootstrap_window_blocks=16,
     )
     path = bootstrap_path(priced, 60, 16, np.random.default_rng(0))
-    steps = run_path(priced, path, cfg, run_index=3, starting_base_fee=8 * GWEI)
+    steps = run_path(
+        priced,
+        path,
+        cfg,
+        cell,
+        run_index=3,
+        starting_base_fee=8 * GWEI,
+    )
 
     assert tuple(steps.columns) == PER_STEP_COLUMNS
     for name in PER_STEP_DEMAND_COLUMNS:
@@ -788,6 +854,7 @@ def test_end_to_end_with_the_demand_model_on_dummy_data():
     assert steps["realized_demand_multiplier"].notna().all()
     assert (steps["realized_demand_multiplier"] > 0).all()
     assert (steps["base_fee_per_gas"] >= MIN_BASE_FEE).all()
-    assert (steps["gas_used"] <= steps["gas_limit"]).all()
+    assert (steps["block_execution_gas_used"] <= steps["gas_limit"]).all()
+    assert (steps["block_state_gas_used"] <= steps["gas_limit"]).all()
     assert steps["arrived_execution_gas"].sum() > 0
     assert steps["included_tx_count"].sum() > 0

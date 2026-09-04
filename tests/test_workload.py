@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from config import DEFAULT_CONFIG
+from config import DEFAULT_CONFIG, Scenario
 from tests.dummy import dummy_block_headers, dummy_tx_gas_results
 from sim.metrics import effective_tip
 from sim.workload import (
@@ -18,11 +18,21 @@ from sim.workload import (
     build_cohorts,
     demand_multiplier,
     demand_pool_bounds,
-    historical_path,
     sample_arrivals,
 )
 
 GWEI = 1_000_000_000
+
+
+def scenario(**overrides) -> Scenario:
+    return Scenario(
+        **{
+            "aggregate_elasticity": 0.175,
+            "demand_level": 1.0,
+            "bootstrap_window_blocks": 32,
+            **overrides,
+        }
+    )
 
 
 def simulatable(raw: pd.DataFrame) -> pd.DataFrame:
@@ -44,7 +54,7 @@ def anchored_cohorts(num_blocks: int = 120, seed: int = 3):
 
 @pytest.fixture(scope="module")
 def cohorts():
-    return build_cohorts(simulatable(dummy_tx_gas_results(num_blocks=120, seed=3)))
+    return anchored_cohorts()
 
 
 @pytest.fixture(scope="module")
@@ -64,9 +74,9 @@ def test_cohorts_are_one_per_source_block_in_tx_index_order(cohorts):
 def test_build_cohorts_drops_unsuccessful_rows_and_demands_derived_columns():
     raw = dummy_tx_gas_results(num_blocks=20, seed=5)
     with pytest.raises(ValueError, match="execution_gas"):
-        build_cohorts(raw)
+        build_cohorts(raw, dummy_block_headers(raw))
 
-    kept = build_cohorts(simulatable(raw)).tx_counts.sum()
+    kept = build_cohorts(simulatable(raw), dummy_block_headers(raw)).tx_counts.sum()
     assert kept < len(raw)
 
 
@@ -104,7 +114,6 @@ def test_cohort_anchor_is_base_fee_plus_the_gas_weighted_realized_tip():
     assert built.anchor_tip.tolist() == [pytest.approx(6.5 * GWEI)]
     assert built.anchor_price.tolist() == [pytest.approx(16.5 * GWEI)]
     assert built.columns["anchor_base_fee"].tolist() == [10 * GWEI] * 2
-    assert built.has_anchors
 
 
 def test_anchor_matches_the_realized_tip_definition_used_on_the_simulated_side(
@@ -129,12 +138,6 @@ def test_anchor_matches_the_realized_tip_definition_used_on_the_simulated_side(
         assert priced_cohorts.anchor_price[index] == pytest.approx(expected)
 
 
-def test_cohorts_without_headers_carry_no_anchors(cohorts):
-    assert cohorts.anchor_price is None
-    assert cohorts.anchor_tip is None
-    assert not cohorts.has_anchors
-
-
 def test_missing_headers_for_a_cohort_block_are_refused():
     raw = dummy_tx_gas_results(num_blocks=10, seed=5)
     headers = dummy_block_headers(raw).iloc[2:]
@@ -146,18 +149,19 @@ def test_missing_headers_for_a_cohort_block_are_refused():
 
 
 def test_multiplier_is_the_demand_level_at_the_anchor_price():
-    cfg = DEFAULT_CONFIG.with_(aggregate_elasticity=0.175, demand_level=2.0)
-    multiplier, clamped = demand_multiplier(cfg, price_signal=8 * GWEI, anchor_price=8 * GWEI)
+    multiplier, clamped = demand_multiplier(
+        DEFAULT_CONFIG, scenario(demand_level=2.0), 8 * GWEI, 8 * GWEI
+    )
     assert multiplier == pytest.approx(2.0)
     assert not clamped
 
 
 def test_demand_rises_as_the_price_falls_and_falls_as_it_rises():
-    cfg = DEFAULT_CONFIG.with_(aggregate_elasticity=0.175, demand_level=1.0)
+    cfg, cell = DEFAULT_CONFIG, scenario()
     anchor = 10 * GWEI
 
-    cheaper, _ = demand_multiplier(cfg, anchor / 4, anchor)
-    dearer, _ = demand_multiplier(cfg, anchor * 4, anchor)
+    cheaper, _ = demand_multiplier(cfg, cell, anchor / 4, anchor)
+    dearer, _ = demand_multiplier(cfg, cell, anchor * 4, anchor)
 
     assert cheaper == pytest.approx(4.0**0.175)
     assert dearer == pytest.approx(0.25**0.175)
@@ -165,16 +169,17 @@ def test_demand_rises_as_the_price_falls_and_falls_as_it_rises():
 
 
 def test_zero_elasticity_is_a_flat_multiplier_whatever_the_price():
-    cfg = DEFAULT_CONFIG.with_(aggregate_elasticity=0.0, demand_level=3.0)
+    cell = scenario(aggregate_elasticity=0.0, demand_level=3.0)
     for price in (1, GWEI, 1_000 * GWEI):
-        assert demand_multiplier(cfg, price, 8 * GWEI) == (3.0, False)
+        assert demand_multiplier(DEFAULT_CONFIG, cell, price, 8 * GWEI) == (3.0, False)
 
 
 def test_a_more_elastic_demand_responds_more_to_the_same_price_fall():
     anchor = 10 * GWEI
     responses = [
         demand_multiplier(
-            DEFAULT_CONFIG.with_(aggregate_elasticity=e, demand_multiplier_bounds=(0.001, 1e9)),
+            DEFAULT_CONFIG.with_(demand_multiplier_bounds=(0.001, 1e9)),
+            scenario(aggregate_elasticity=e),
             anchor / 10,
             anchor,
         )[0]
@@ -185,56 +190,42 @@ def test_a_more_elastic_demand_responds_more_to_the_same_price_fall():
 
 
 def test_the_clamp_bounds_an_extrapolated_multiplier_and_says_so():
-    cfg = DEFAULT_CONFIG.with_(
-        aggregate_elasticity=0.175, demand_multiplier_bounds=(0.5, 2.0)
-    )
+    cfg = DEFAULT_CONFIG.with_(demand_multiplier_bounds=(0.5, 2.0))
+    cell = scenario()
     anchor = GWEI
 
     # A base fee at the 1-wei floor is a 1e9 price fall: (1e9 ** 0.175) ~ 38x.
-    high, clamped_high = demand_multiplier(cfg, 1, anchor)
+    high, clamped_high = demand_multiplier(cfg, cell, 1, anchor)
     assert (high, clamped_high) == (2.0, True)
 
-    low, clamped_low = demand_multiplier(cfg, anchor * 10**9, anchor)
+    low, clamped_low = demand_multiplier(cfg, cell, anchor * 10**9, anchor)
     assert (low, clamped_low) == (0.5, True)
 
-    inside, clamped = demand_multiplier(cfg, anchor, anchor)
+    inside, clamped = demand_multiplier(cfg, cell, anchor, anchor)
     assert (inside, clamped) == (1.0, False)
 
 
 def test_the_clamp_bounds_the_price_response_not_the_chosen_demand_level():
     """A level above the bound is a deliberate assumption, not an extrapolation."""
-    cfg = DEFAULT_CONFIG.with_(
-        aggregate_elasticity=0.175, demand_level=30.0, demand_multiplier_bounds=(0.5, 2.0)
-    )
+    cfg = DEFAULT_CONFIG.with_(demand_multiplier_bounds=(0.5, 2.0))
+    cell = scenario(demand_level=30.0)
     anchor = GWEI
 
-    at_anchor, clamped = demand_multiplier(cfg, anchor, anchor)
+    at_anchor, clamped = demand_multiplier(cfg, cell, anchor, anchor)
     assert (at_anchor, clamped) == (30.0, False)
 
     # The response saturates at 2x, so the product is 60x, not capped at 2x.
-    extrapolated, clamped = demand_multiplier(cfg, 1, anchor)
+    extrapolated, clamped = demand_multiplier(cfg, cell, 1, anchor)
     assert (extrapolated, clamped) == (60.0, True)
 
 
 def test_a_non_positive_price_or_anchor_falls_back_to_the_level():
-    cfg = DEFAULT_CONFIG.with_(aggregate_elasticity=0.175, demand_level=1.5)
-    assert demand_multiplier(cfg, 0, 8 * GWEI) == (1.5, False)
-    assert demand_multiplier(cfg, 8 * GWEI, 0) == (1.5, False)
+    cell = scenario(demand_level=1.5)
+    assert demand_multiplier(DEFAULT_CONFIG, cell, 0, 8 * GWEI) == (1.5, False)
+    assert demand_multiplier(DEFAULT_CONFIG, cell, 8 * GWEI, 0) == (1.5, False)
 
 
 # --- Arrival paths ----------------------------------------------------------------
-
-
-def test_historical_path_is_the_continuous_trace(cohorts):
-    path = historical_path(cohorts, 50)
-    assert tuple(path.columns) == PATH_COLUMNS
-    assert path["cohort_index"].tolist() == list(range(50))
-    assert (path["window_instance"] == 0).all()
-    assert path["position_in_window"].tolist() == list(range(50))
-    assert (path["source_block_number"].to_numpy() == cohorts.block_numbers[:50]).all()
-
-    with pytest.raises(ValueError, match="exceeds"):
-        historical_path(cohorts, len(cohorts) + 1)
 
 
 def test_bootstrap_path_never_wraps_and_preserves_within_window_order(cohorts):
@@ -278,7 +269,7 @@ def test_bootstrap_window_cannot_exceed_the_source_trace(cohorts):
 def test_bootstrap_pool_is_exactly_the_step_s_own_window(cohorts):
     window = 16
     path = bootstrap_path(cohorts, 64, window, np.random.default_rng(2))
-    low, high = demand_pool_bounds(cohorts, path, window, "moving_block_bootstrap")
+    low, high = demand_pool_bounds(cohorts, path)
 
     for position in range(len(path)):
         instance = path.loc[position, "window_instance"]
@@ -287,17 +278,6 @@ def test_bootstrap_pool_is_exactly_the_step_s_own_window(cohorts):
         assert high[position] == cohorts.offsets[members.max() + 1]
         # Every step in a window shares one pool, and the arriving cohort is in it.
         assert low[position] <= cohorts.offsets[path.loc[position, "cohort_index"]]
-
-
-def test_historical_pool_is_a_trailing_window(cohorts):
-    window = 8
-    path = historical_path(cohorts, 30)
-    low, high = demand_pool_bounds(cohorts, path, window, "historical")
-
-    assert low[0] == cohorts.offsets[0]  # clamped at the start of the trace
-    assert high[0] == cohorts.offsets[1]
-    assert low[20] == cohorts.offsets[13]  # 20 - 8 + 1
-    assert high[20] == cohorts.offsets[21]
 
 
 # --- Arrival sampling -------------------------------------------------------------
