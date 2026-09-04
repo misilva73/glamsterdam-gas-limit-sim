@@ -85,9 +85,9 @@ def realized_tip_per_gas(
 ) -> float:
     """Gas-weighted mean tip actually paid in a block, on the sender-cost basis.
 
-    Same basis as the historical anchor tip in `sim.workload`, so the demand
-    model compares like with like. An empty block says nothing about the going
-    tip, so it carries the previous estimate forward rather than reporting zero.
+    Same basis as `sim.workload.DemandReference.tip`, so the demand model
+    compares like with like. An empty block says nothing about the going tip, so
+    it carries the previous estimate forward rather than reporting zero.
     """
     if sender_gas_used <= 0:
         return fallback
@@ -134,9 +134,9 @@ def step_record(
     *,
     run_index: int,
     simulation_position: int,
-    source_block_number: int,
+    pool_start_block: int,
     demand_price_signal: float,
-    cohort_anchor_price: float,
+    demand_anchor_price: float,
     realized_demand_multiplier: float,
     demand_multiplier_clamped: bool,
     base_fee_per_gas: int,
@@ -157,11 +157,11 @@ def step_record(
         "run_index": run_index,
         "aggregate_elasticity": scenario.aggregate_elasticity,
         "demand_level": scenario.demand_level,
-        "bootstrap_window_blocks": scenario.bootstrap_window_blocks,
+        "composition_pool_blocks": scenario.composition_pool_blocks,
         "simulation_position": simulation_position,
-        "source_block_number": source_block_number,
+        "pool_start_block": pool_start_block,
         "demand_price_signal": demand_price_signal,
-        "cohort_anchor_price": cohort_anchor_price,
+        "demand_anchor_price": demand_anchor_price,
         "realized_demand_multiplier": realized_demand_multiplier,
         "demand_multiplier_clamped": demand_multiplier_clamped,
         "base_fee_per_gas": base_fee_per_gas,

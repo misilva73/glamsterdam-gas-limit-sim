@@ -33,10 +33,9 @@ data/cache.py                 Parquet + JSON-sidecar cache used by both loaders;
                               an entry is one file, or a directory of parts when
                               streamed
 
-sim/workload.py               cohorts + demand anchors, moving-block-bootstrap paths,
-                              the demand model (multiplier,
-                              sampling pools, gas-target sampling, bid adaptation),
-                              RNG streams
+sim/workload.py               cohorts + the trace-level demand reference, per-step
+                              composition pools, the demand model (multiplier,
+                              gas-target sampling, bid adaptation), RNG streams
 sim/engine.py                 the per-block loop: fee update, gas-limit ramp, demand
                               draw, block fill, price-signal update
 sim/metrics.py                pure protocol functions + per-step record assembly
@@ -129,18 +128,26 @@ Model in `METHODOLOGY.md` §6.
   alone is unbounded below and overstates the price fall whenever tips dominate —
   exactly the 200M regime. The EMA is also the damping term on a loop whose gain is
   large at `e ~ 0.175`.
-- **`cohort_anchor_price` must stay on the same basis as the simulated side**:
-  header base fee plus the *realised gas-weighted mean tip*, matching
-  `priority_fees_wei / sender_gas_used`. Anchor on the bare header base fee and the
-  ratio is biased at every step, so `m != demand_level` even at the anchor.
-- **The price signal is seeded at the first cohort's anchor**, not at
+- **`DemandReference.price` must stay on the same basis as the simulated side**:
+  historical base fee plus the *realised gas-weighted mean tip*, matching
+  `priority_fees_wei / sender_gas_used`. Anchor on bare base fees and the ratio is
+  biased at every step, so `m != demand_level` even at the reference.
+- **The demand reference is one constant for the whole trace, gas-weighted over
+  transactions.** An isoelastic curve is only a curve relative to a fixed
+  reference pair, so both `price` and `gas` are trace-level; that is what gives
+  `demand_level` a stable meaning and keeps `realized_demand_multiplier` a
+  function of the simulated price alone. Averaging per-cohort anchors instead
+  would weight a 5M-gas block like a 30M-gas one and drift off basis; anchoring
+  per step on its own pool would put a different curve under every step.
+- **The price signal is seeded at the reference price**, not at
   `starting_base_fee`, which makes step 0's multiplier exactly `demand_level`
-  whatever the starting base fee. A test pins that fixed point.
+  whatever the starting base fee — and keeps it there until the simulated price
+  leaves the historical average. A test pins that fixed point.
 - **Everything feeding the loop is parent-derived.** The multiplier uses the signal
   as it stood *before* this block was built; the signal updates from the block's
   outcome afterwards.
 - **Arrivals must be emitted in `(source_block_number, tx_index, replica_index)`
-  order.** `sample_arrivals` draws from a whole bootstrap window, so its picks are
+  order.** `sample_arrivals` draws from a whole composition pool, so its picks are
   unordered; it sorts by flat position, which *is* that order. Skip that sort and
   the engine's append-only mempool invariant breaks silently.
 - **Legacy rows shift, dynamic-fee rows scale.** A legacy row's whole headroom is
@@ -150,9 +157,13 @@ Model in `METHODOLOGY.md` §6.
 - **Every cohort is anchored.** `build_cohorts` always requires `headers`; there is
   no headerless engine mode. This keeps bid adaptation and the demand fixed point
   on one invariant even when a scenario uses zero elasticity.
-- **Arrivals are recorded, not derived.** Sampling means `arrived_*_gas` cannot be
-  recomputed from the path plus a scalar, so anything reconciling arrivals against
-  the backlog must read those columns.
+- **Arrivals are recorded, not derived.** The *whole* arrival is sampled, so
+  `arrived_*_gas` cannot be recomputed from the path at all — anything reconciling
+  arrivals against the backlog must read those columns. It also means a single
+  path's per-step mix is noisy; aggregates across runs carry the signal.
+- **Uniform draws, gas-based stopping.** `_sample_to_gas_target` picks positions
+  uniformly and only *stops* on cumulative gas. Weighting the draw by gas would
+  over-represent large transactions and reshape the mix the pool exists to supply.
 - **`float64(int64_max)` rounds up to 2\*\*63.** The bid rescale clips to
   `_INT64_FLOAT_CAP`, the largest float64 that survives the cast; clipping to
   `int64_max` still produces an invalid cast, which numpy reports as a warning and
@@ -160,9 +171,15 @@ Model in `METHODOLOGY.md` §6.
 
 ## Behavioural decisions worth knowing
 
-- **Arrival paths are bootstrap-only.** Every cell runs
-  `num_bootstrap_runs` moving-block-bootstrap samples. There is no historical-only
-  mode, historical reference path, or `arrival_mode` output dimension.
+- **Composition pools are not a moving-block bootstrap.** Every step draws its own
+  start independently, so consecutive steps are unrelated and none of the trace's
+  autocorrelation reaches the arrival process; all persistence comes from mempool,
+  base fee, and the EMA. Contiguity buys *local coherence* — one fee regime per
+  mix — not preserved dependence. There is no historical-only mode, historical
+  reference path, or `arrival_mode` output dimension.
+- **`pool_start_block` identifies the draw, not the arrivals.** A step's
+  transactions come from anywhere in its pool; they are reproducible from
+  `run_index` plus the recorded seeds, never from that column alone.
 - **A checkpoint writes its one cell part before the summary row describing it.**
   `--resume` treats complete cells as the leading run whose parts are present,
   bounded by the summary row count, and truncates the summary to that prefix.
@@ -189,7 +206,7 @@ Model in `METHODOLOGY.md` §6.
   configured initial state verbatim and the ramp first applies at position 1.
   Glamsterdam is always live from position 0; there is no activation step.
 - **`tx_hash` is not carried through cohorts or expansion.** A week is ~8M rows and
-  object-dtype hashes cost ~1 GB. Identity is `(run_index, window_instance,
+  object-dtype hashes cost ~1 GB. Identity is `(run_index, simulation_position,
   source_block_number, tx_index, replica_index)`, 1:1 with a `tx_hash`-based one.
   Expanded workload is kept only in the engine's parallel arrays, never a frame.
 - **`priority_fees_wei` is float64 end to end, including the output column**: a
@@ -205,14 +222,14 @@ Model in `METHODOLOGY.md` §6.
   included; there is no inclusion policy anywhere in the pipeline, so applying a
   success filter here would invent one. It only refuses an empty frame.
 - **Cohorts are positional and may skip block numbers** (a source block with no
-  replay rows has no cohort), so bootstrap windows are contiguous in
-  *cohort index*, not block number. The induced sampling remainder is drawn from
-  the step's whole window rather than the arriving cohort, which would make it a
-  near copy of one block.
+  replay rows has no cohort), so composition pools are contiguous in *cohort
+  index*, not block number. A pool never wraps the trace end, so its last `L - 1`
+  cohorts appear in fewer pools — the accepted edge bias; wrapping would build a
+  mix out of two unrelated fee regimes.
 - **Gas-target sampling accepts its overshoot**, keeping the draw that crosses the
   target rather than Bernoulli-correcting it: the error is one transaction against
-  a cohort-scale target. `_MAX_SAMPLING_BATCHES` raises rather than looping forever
-  on a degenerate pool.
+  a block-scale target, biasing arrived gas slightly up. `_MAX_SAMPLING_BATCHES`
+  raises rather than looping forever on a degenerate pool.
 - **`tests/dummy.py` writes `max_priority_fee_per_gas = 0` for legacy/access-list
   rows**, the likely real-producer value. Deliberately not a copy of the gas price:
   with a copy, `min(prio, max_fee - base_fee)` collapses into the legacy rule and
@@ -260,10 +277,16 @@ at high demand the backlog grows monotonically, so throughput falls with horizon
 | 7,200 steps @5x | 8.6 s | ~840 | 834 MB | 2.8M |
 | 50,400 steps @5x | 503 s | ~100 | 1,749 MB | 16.7M |
 
-A full-week 5x cell is ~8.4 min/path, so 20 bootstrap runs ≈ 2.8 h at ~1.8 GB per
-worker; low-demand cells are essentially free. **Plan the grid accordingly** — cost
-is dominated entirely by the cells whose realized multiplier runs high, and the two
-demand axes multiply (the defaults are 9 cells at the single default `L = 32`).
+A full-week 5x cell is ~8.4 min/path, so 20 runs ≈ 2.8 h at ~1.8 GB per worker;
+low-demand cells are essentially free. **Plan the grid accordingly** — cost is
+dominated entirely by the cells whose realized multiplier runs high, and the two
+demand axes multiply (the defaults are 9 cells at the single default `L = 16`).
+
+These figures predate moving *all* arrivals into `_sample_to_gas_target`. Whole
+cohort copies used to cover the integer part of the multiplier with a cheap
+`np.repeat` and no RNG; now every arriving transaction is drawn and the full
+arrival is sorted, so expect the arrival stage to cost several times what it did
+at high multipliers. Re-measure before planning a full-week sweep.
 
 Memory no longer scales with the grid: each cell is written to `per_step/` and
 freed before the next one starts, so the retained source frame and cohorts set the
@@ -300,11 +323,12 @@ implementations, and compaction cadence is asserted not to change output.
    checkpointed cells are a *prefix* of `grid_cells` — true because cells run
    sequentially, but it means hand-deleting a part file from the middle silently
    rewinds the sweep to that point rather than filling the hole.
-3. **Re-derive the bootstrap window `L` on real data.** The dummy trace's
-   autocorrelation is set by its own AR(1) parameters, so the current answer is
-   circular. `tests/dummy.py` in particular draws dynamic-fee priority fees i.i.d.
-   per transaction, so `median_max_priority_fee_per_gas` decorrelates in ~1 block —
-   an artifact, not a finding.
+3. **Re-derive the composition-pool width `L` on real data.** What `L` has to be
+   wide enough for is now *local coherence* — enough transaction variety to look
+   like real demand, without spanning two fee regimes — so the dummy trace's own
+   AR(1) parameters say nothing about it. `tests/dummy.py` in particular draws
+   dynamic-fee priority fees i.i.d. per transaction, so its fee mix decorrelates
+   in ~1 block, an artifact rather than a finding.
 4. **`baseline_only_failure` is always empty on dummy data** by construction, so
    that row of `replay_outcome_summary` is unit-tested but never exercised end to
    end.

@@ -15,8 +15,8 @@ the real simulatable trace is almost never state-bound (see `AGENTS.md`).
 Shape choices that matter for the simulation are deliberate, not decorative:
 
 * Cohort size and fee level are autocorrelated (AR(1) plus a diurnal cycle), so
-  moving-block bootstrap window selection and autocorrelation-based choice of
-  `L` have something real to bite on.
+  neighbouring cohorts genuinely resemble each other and a contiguous
+  composition pool is a different mix from a trace-wide one.
 * A minority of transactions carry `max_fee_per_gas` below the prevailing base
   fee, so fee-ineligible backlog is non-empty.
 * The calldata floor binds on a minority of rows, so

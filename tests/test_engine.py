@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,7 +11,15 @@ import pytest
 from config import DEFAULT_CONFIG, MAX_BASE_FEE, MIN_BASE_FEE, Scenario, SimConfig
 from tests.dummy import dummy_tx_gas_results
 from schemas import PER_STEP_COLUMNS, PER_STEP_DEMAND_COLUMNS
-from sim.engine import fill_block, run_path, select_included
+from sim.engine import (
+    MEMPOOL_FIELDS,
+    Mempool,
+    admit,
+    fill_and_measure,
+    fill_block,
+    run_path,
+    select_included,
+)
 from sim.metrics import (
     effective_tip,
     next_base_fee,
@@ -19,8 +29,8 @@ from sim.metrics import (
 )
 from sim.workload import (
     PATH_COLUMNS,
-    bootstrap_path,
     build_cohorts,
+    composition_pools,
     demand_multiplier,
 )
 from tests.test_workload import anchored_cohorts, simulatable
@@ -57,7 +67,7 @@ def scenario(**overrides) -> Scenario:
         **{
             "aggregate_elasticity": 0.0,
             "demand_level": 1.0,
-            "bootstrap_window_blocks": 32,
+            "composition_pool_blocks": 32,
             **overrides,
         }
     )
@@ -79,28 +89,37 @@ def run(
     cell: Scenario | None = None,
 ) -> pd.DataFrame:
     cohorts = build_cohorts(frame, headers_for(frame, GWEI))
-    cell = cell or scenario()
-    path = sequential_bootstrap_path(cohorts, len(cohorts), cell.bootstrap_window_blocks)
+    return run_whole_trace_pool(cohorts, cfg, cell or scenario(), base_fee=base_fee)
+
+
+def run_whole_trace_pool(
+    cohorts, cfg: SimConfig, cell: Scenario, *, base_fee: int
+) -> pd.DataFrame:
+    """Run every step against one fixed pool: the entire source trace.
+
+    Mechanism tests want the composition draw to say as little as possible, so
+    every step pools all cohorts and starts at the same place. What varies is
+    then the fee arithmetic and the fill, not which blocks a step happened to
+    draw. The cell's own `composition_pool_blocks` is overridden to match, since
+    the pool width has to agree with the path the engine is handed.
+    """
     return run_path(
         cohorts,
-        path,
+        fixed_pool_path(cohorts, len(cohorts)),
         cfg,
-        cell,
+        replace(cell, composition_pool_blocks=len(cohorts)),
         run_index=0,
         starting_base_fee=base_fee,
     )
 
 
-def sequential_bootstrap_path(cohorts, horizon: int, window: int) -> pd.DataFrame:
-    """Deterministic bootstrap-shaped path for mechanism tests."""
-    position = np.arange(horizon, dtype=np.int64)
+def fixed_pool_path(cohorts, horizon: int) -> pd.DataFrame:
+    """A path whose every step draws from the pool starting at cohort 0."""
     return pd.DataFrame(
         {
-            "simulation_position": position,
-            "cohort_index": position,
-            "source_block_number": cohorts.block_numbers[position],
-            "window_instance": position // window,
-            "position_in_window": position % window,
+            "simulation_position": np.arange(horizon, dtype=np.int64),
+            "pool_start_index": np.zeros(horizon, np.int64),
+            "pool_start_block": np.full(horizon, cohorts.block_numbers[0], np.int64),
         },
         columns=list(PATH_COLUMNS),
     )
@@ -323,18 +342,42 @@ def test_tip_tranching_reproduces_a_single_full_sort(monkeypatch):
         assert chosen.tolist() == expected.tolist()
 
 
+def mempool_of(*rows: dict) -> Mempool:
+    """A mempool holding exactly these rows, in the given order."""
+    columns = [DEFAULT_ROW | row for row in rows]
+    arrivals = {
+        name: np.array([row.get(name, 0) for row in columns], np.int64)
+        for name in MEMPOOL_FIELDS
+        if name != "is_legacy"
+    }
+    arrivals["is_legacy"] = np.zeros(len(columns), bool)
+    arrivals["replica_index"] = np.arange(len(columns), dtype=np.int64)
+    pool = Mempool()
+    admit(pool, arrivals)
+    return pool
+
+
 def test_high_tip_transaction_is_skipped_and_a_small_low_tip_one_included():
-    frame = tx_frame(
+    """Skip-and-continue plus the metrics the engine reports for it.
+
+    Built as an exact mempool rather than run through `run`: arrivals are sampled
+    now, so no run can pin one hand-picked transaction per row. What is under
+    test here is the fill and its accounting, not the draw.
+    """
+    pool = mempool_of(
         dict(max_priority_fee_per_gas=100 * GWEI, execution_gas=900_000, schedule_gas_used=900_000),
         dict(max_priority_fee_per_gas=50 * GWEI, execution_gas=200_000, schedule_gas_used=200_000),
         dict(max_priority_fee_per_gas=10 * GWEI, execution_gas=50_000, schedule_gas_used=50_000),
     )
-    step = run(frame, fixed_limit_config(1_000_000)).iloc[0]
 
-    assert step["included_tx_count"] == 2
-    assert step["block_execution_gas_used"] == 950_000
-    assert step["backlog_tx_count"] == 1
-    assert step["backlog_eligible_execution_gas"] == 200_000
+    chosen, block = fill_and_measure(pool, GWEI, 1_000_000, 1_150_000, 0)
+
+    # The 200k row does not fit behind the 900k one, so the walk skips it and
+    # takes the 50k row that does.
+    assert chosen.tolist() == [0, 2]
+    assert block["block_execution_gas_used"] == 950_000
+    assert block["backlog"]["backlog_tx_count"] == 1
+    assert block["backlog"]["backlog_eligible_execution_gas"] == 200_000
 
 
 def test_state_bound_block_leaves_execution_gas_unused():
@@ -509,7 +552,7 @@ def test_a_run_ends_with_the_last_arrival_and_discards_what_is_queued():
     assert steps.loc[0, "backlog_execution_gas"] == 1_600_000
     assert steps.loc[0, "backlog_eligible_execution_gas"] == 1_600_000
     assert steps.loc[0, "backlog_state_gas"] == 0
-    assert steps["source_block_number"].notna().all()
+    assert steps["pool_start_block"].notna().all()
 
 
 @pytest.fixture(scope="module")
@@ -519,9 +562,9 @@ def dummy_cohorts():
 
 
 def test_same_seed_and_config_reproduce_an_identical_frame(dummy_cohorts):
-    cfg, cell = mechanism_config(), scenario(demand_level=1.5, bootstrap_window_blocks=16)
-    path = bootstrap_path(
-        dummy_cohorts, 40, cell.bootstrap_window_blocks, np.random.default_rng(4)
+    cfg, cell = mechanism_config(), scenario(demand_level=1.5, composition_pool_blocks=16)
+    path = composition_pools(
+        dummy_cohorts, 40, cell.composition_pool_blocks, np.random.default_rng(4)
     )
 
     execute = lambda index: run_path(
@@ -541,33 +584,35 @@ def test_same_seed_and_config_reproduce_an_identical_frame(dummy_cohorts):
 
 
 def test_backlog_gas_conserves_arrivals_minus_inclusions(dummy_cohorts):
-    """Every gas unit that arrives is either included or still in the backlog."""
-    cfg = mechanism_config()
-    cell = scenario()
-    path = sequential_bootstrap_path(dummy_cohorts, 40, cell.bootstrap_window_blocks)
+    """Every gas unit that arrives is either included or still in the backlog.
+
+    Arrivals are read back from the output rather than recomputed from the path:
+    they are sampled, so the path no longer determines them.
+    """
+    cfg, cell = mechanism_config(), scenario(composition_pool_blocks=16)
     steps = run_path(
         dummy_cohorts,
-        path,
+        composition_pools(dummy_cohorts, 40, 16, np.random.default_rng(6)),
         cfg,
         cell,
         run_index=0,
         starting_base_fee=8 * GWEI,
     )
 
-    for dimension in ("execution_gas", "state_gas"):
-        arrived = np.array(
-            [dummy_cohorts.cohort(i)[dimension].sum() for i in path["cohort_index"]]
-        )
-        used = steps[f"block_{dimension.replace('_gas', '')}_gas_used"].to_numpy()
-        assert (steps[f"backlog_{dimension}"].to_numpy() == np.cumsum(arrived - used)).all()
+    for dimension in ("execution", "state"):
+        arrived = steps[f"arrived_{dimension}_gas"].to_numpy()
+        used = steps[f"block_{dimension}_gas_used"].to_numpy()
+        assert (
+            steps[f"backlog_{dimension}_gas"].to_numpy() == np.cumsum(arrived - used)
+        ).all()
 
 
 def test_mempool_compaction_cadence_does_not_change_results(dummy_cohorts, monkeypatch):
     """Tombstoning is an optimisation: when it is collected must not matter."""
     import sim.engine as engine
 
-    cfg, cell = mechanism_config(), scenario(demand_level=2.5, bootstrap_window_blocks=16)
-    path = bootstrap_path(dummy_cohorts, 60, 16, np.random.default_rng(5))
+    cfg, cell = mechanism_config(), scenario(demand_level=2.5, composition_pool_blocks=16)
+    path = composition_pools(dummy_cohorts, 60, 16, np.random.default_rng(5))
     run = lambda: run_path(
         dummy_cohorts,
         path,
@@ -584,9 +629,9 @@ def test_mempool_compaction_cadence_does_not_change_results(dummy_cohorts, monke
 
 
 def test_end_to_end_run_on_dummy_data(dummy_cohorts):
-    cfg, cell = mechanism_config(), scenario(demand_level=2.0, bootstrap_window_blocks=16)
-    path = bootstrap_path(
-        dummy_cohorts, 60, cell.bootstrap_window_blocks, np.random.default_rng(0)
+    cfg, cell = mechanism_config(), scenario(demand_level=2.0, composition_pool_blocks=16)
+    path = composition_pools(
+        dummy_cohorts, 60, cell.composition_pool_blocks, np.random.default_rng(0)
     )
     steps = run_path(
         dummy_cohorts,
@@ -630,14 +675,7 @@ def run_priced(
     base_fee: int,
 ) -> pd.DataFrame:
     cohorts = build_cohorts(frame, headers_for(frame, anchor_base_fee))
-    return run_path(
-        cohorts,
-        sequential_bootstrap_path(cohorts, len(cohorts), cell.bootstrap_window_blocks),
-        cfg,
-        cell,
-        run_index=0,
-        starting_base_fee=base_fee,
-    )
+    return run_whole_trace_pool(cohorts, cfg, cell, base_fee=base_fee)
 
 
 def priced_config(**overrides) -> SimConfig:
@@ -657,7 +695,7 @@ def test_step_zero_sits_exactly_on_the_anchor_whatever_the_starting_base_fee():
         assert steps.loc[0, "realized_demand_multiplier"] == pytest.approx(1.5)
         assert not steps.loc[0, "demand_multiplier_clamped"]
         # tip is min(1 gwei, 100 - 10) = 1 gwei, so the anchor price is 11 gwei.
-        assert steps.loc[0, "cohort_anchor_price"] == pytest.approx(11 * GWEI)
+        assert steps.loc[0, "demand_anchor_price"] == pytest.approx(11 * GWEI)
         assert steps.loc[0, "demand_price_signal"] == pytest.approx(11 * GWEI)
 
 
@@ -669,21 +707,14 @@ def test_the_engine_applies_the_multiplier_the_demand_model_specifies(dummy_coho
     steps = run_priced_cohorts(priced, cfg, cell, base_fee=4 * GWEI)
 
     expected = [
-        demand_multiplier(cfg, cell, row.demand_price_signal, row.cohort_anchor_price)[0]
+        demand_multiplier(cfg, cell, row.demand_price_signal, row.demand_anchor_price)[0]
         for row in steps.itertuples()
     ]
     assert steps["realized_demand_multiplier"].tolist() == pytest.approx(expected)
 
 
 def run_priced_cohorts(cohorts, cfg: SimConfig, cell: Scenario, *, base_fee: int):
-    return run_path(
-        cohorts,
-        sequential_bootstrap_path(cohorts, len(cohorts), cell.bootstrap_window_blocks),
-        cfg,
-        cell,
-        run_index=0,
-        starting_base_fee=base_fee,
-    )
+    return run_whole_trace_pool(cohorts, cfg, cell, base_fee=base_fee)
 
 
 def test_the_price_signal_is_an_ema_of_the_effective_price_not_the_base_fee():
@@ -734,7 +765,7 @@ def test_demand_shrinks_above_the_anchor_price_and_grows_below_it():
 
     multiplier = steps["realized_demand_multiplier"].to_numpy()
     signal = steps["demand_price_signal"].to_numpy()
-    anchor = steps["cohort_anchor_price"].to_numpy()
+    anchor = steps["demand_anchor_price"].to_numpy()
 
     assert (multiplier < 1.0).any() and (multiplier > 1.0).any()
     # Exactly, at every step: demand is below its level iff the price the model
@@ -771,7 +802,7 @@ def test_every_step_records_a_drawn_demand_response():
 
     assert len(steps) == 20
     assert steps["realized_demand_multiplier"].notna().all()
-    assert steps["cohort_anchor_price"].notna().all()
+    assert steps["demand_anchor_price"].notna().all()
     assert steps["demand_price_signal"].notna().all()
     assert (steps["arrived_tx_count"] > 0).all()
 
@@ -811,9 +842,9 @@ def test_the_demand_model_run_is_reproducible_and_run_dependent():
     cell = scenario(
         aggregate_elasticity=0.175,
         demand_level=1.5,
-        bootstrap_window_blocks=16,
+        composition_pool_blocks=16,
     )
-    path = bootstrap_path(priced, 40, 16, np.random.default_rng(4))
+    path = composition_pools(priced, 40, 16, np.random.default_rng(4))
     run = lambda index: run_path(
         priced,
         path,
@@ -824,7 +855,7 @@ def test_the_demand_model_run_is_reproducible_and_run_dependent():
     )
 
     pd.testing.assert_frame_equal(run(0), run(0))
-    # The sampling stream is per run, so paths differ even on one window draw.
+    # The sampling stream is per run, so paths differ even on one pool draw.
     assert not run(0)["arrived_execution_gas"].equals(run(1)["arrived_execution_gas"])
 
 
@@ -834,9 +865,9 @@ def test_end_to_end_with_the_demand_model_on_dummy_data():
     cell = scenario(
         aggregate_elasticity=0.175,
         demand_level=2.0,
-        bootstrap_window_blocks=16,
+        composition_pool_blocks=16,
     )
-    path = bootstrap_path(priced, 60, 16, np.random.default_rng(0))
+    path = composition_pools(priced, 60, 16, np.random.default_rng(0))
     steps = run_path(
         priced,
         path,

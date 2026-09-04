@@ -62,17 +62,25 @@ PER_STEP_IDENTITY_COLUMNS = (
     "run_index",
     "aggregate_elasticity",
     "demand_level",
-    "bootstrap_window_blocks",
+    "composition_pool_blocks",
     "simulation_position",
-    "source_block_number",
+    # First source block of the step's composition pool. A step has no single
+    # source block any more -- its arrivals are sampled across the whole pool --
+    # so this identifies the *draw*, not the arrivals. The arrivals themselves
+    # are reproducible from `run_index` plus the seeds.
+    "pool_start_block",
 )
 
 # The demand axes are scenario-level (identity); the multiplier they produce is a
 # per-step outcome, hence `realized_` -- it moves with the price signal within a
 # single run and is not a scenario key.
+#
+# `demand_anchor_price` is constant within a run (the trace-level reference the
+# curve is anchored at) and is carried per row anyway, so a per-step frame can be
+# read back without its manifest and the multiplier recomputed from it alone.
 PER_STEP_DEMAND_COLUMNS = (
     "demand_price_signal",
-    "cohort_anchor_price",
+    "demand_anchor_price",
     "realized_demand_multiplier",
     "demand_multiplier_clamped",
 )
@@ -90,7 +98,7 @@ PER_STEP_METRIC_COLUMNS = (
     "sender_gas_used",
     "priority_fees_wei",
     "arrived_tx_count",
-    # Arrivals are sampled, so they are no longer recoverable from the path plus
+    # Arrivals are wholly sampled, so they are not recoverable from the path plus
     # a scalar multiplier -- they have to be recorded.
     "arrived_execution_gas",
     "arrived_state_gas",

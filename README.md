@@ -5,8 +5,8 @@ gas limit ramps from Fusaka's 60M toward 200M under Glamsterdam gas repricing?
 
 This simulator takes real historical mainnet transactions re-executed under
 Glamsterdam rules (via the `reth-research` replay), replays them as arrival
-cohorts against a gas limit climbing at 1/1024 per block, and reports per-block
-outcomes across a grid of demand scenarios with repeated bootstrap paths for
+arrivals against a gas limit climbing at 1/1024 per block, and reports per-block
+outcomes across a grid of demand scenarios with repeated resampled paths for
 downstream uncertainty bands.
 
 Two things distinguish it from a one-dimensional gas model:
@@ -15,10 +15,12 @@ Two things distinguish it from a one-dimensional gas model:
   block has two simultaneous capacity constraints and
   `gas_used = max(execution, state)`. Both dimension totals are recorded, so the
   binding dimension remains directly derivable.
-- Demand **responds to price**. How much demand arrives at a step comes from an
-  isoelastic demand model calibrated on empirical elasticities and anchored per
-  cohort on the price that cohort was historically observed at. Base fee → demand
-  → utilisation → base fee is a closed loop.
+- Demand **responds to price**. How much gas arrives at a step comes from an
+  isoelastic demand model calibrated on empirical elasticities, anchored on one
+  reference price for the whole trace. Base fee → demand → utilisation → base fee
+  is a closed loop. *Which* transactions make up that gas is drawn separately,
+  from a contiguous pool of source blocks redrawn every step, so quantity and
+  composition never confound each other.
 
 **`METHODOLOGY.md` is the deep dive**: data sources, inputs, the demand model, the
 engine, every output column, the assumptions, and how to read a result. Read it
@@ -75,7 +77,7 @@ given run actually resolved to is recorded in its `manifest.json`.
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--horizon N` | Arrival steps, i.e. how many cohorts are fed in. | trace length |
-| `--num-runs N` | Bootstrap paths per grid cell — the width of the p10–p90 band. | `20` |
+| `--num-runs N` | Resampled paths per grid cell — the width of the p10–p90 band. | `20` |
 | `--seed N` | Master seed; every stream derives from it, so a simulation is reproducible. | `20260831` |
 | `--starting-base-fee WEI` | Override the base fee at step 0. | parent header |
 | `--fusaka-gas-limit N` | Gas limit at step 0. | `60,000,000` |
@@ -85,7 +87,7 @@ given run actually resolved to is recorded in its `manifest.json`.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
-| `--price-ema-blocks N` | Span of the EMA smoothing the effective gas price the model reacts to. The elasticities are daily, so this is hours, not blocks. | `300` |
+| `--price-ema-blocks N` | Span of the EMA smoothing the effective gas price the model reacts to. The elasticities are daily, so this is hours, not blocks. | `200` |
 | `--multiplier-bounds LOW HIGH` | Clamp on the **price response** `(p/p0)**-e`, not on the product with the demand level. `p**-e` is unbounded as the price falls and the elasticity was estimated over a narrow price range, so a saturating response is capped and flagged per step; a deliberately high `--demand-levels` is not capped. | `0.05 20` |
 | `--no-bid-adaptation` | Freeze historical fee caps instead of repricing them from their own block's base fee to the simulated one. Makes the fee filter, not the elasticity, set how much demand is eligible. | off |
 
@@ -96,8 +98,8 @@ narrow them explicitly on a long trace.
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--elasticities E [E ...]` | Demand-*shape* axis: aggregate price elasticity. `0` is a flat multiplier with no price response, and is no longer swept by default: with bid adaptation on it cannot shed demand above `--demand-levels 1`, so the base fee runs to the `MAX_BASE_FEE` ceiling and `base_fee_clamped_share` goes non-zero. | `0.1 0.2 0.3` |
-| `--demand-levels A [A ...]` | Demand-*level* axis: latent-demand multiplier at the anchor price, standing in for never-included and secular-growth demand. | `1 1.5 2` |
-| `--window-blocks L [L ...]` | Bootstrap window length in cohorts. Pass multiple values for an explicit robustness sweep. | `32` |
+| `--demand-levels A [A ...]` | Demand-*level* axis: latent-demand multiplier at the reference price, so `1` is one trace-average block's worth of gas per step. Stands in for never-included and secular-growth demand. | `1 1.5 2` |
+| `--pool-blocks L [L ...]` | Composition-pool width in cohorts: how many contiguous source blocks each step draws its transaction *mix* from. Sets the mix only — the demand model sets the quantity — so this is a robustness knob, not an assumption. Pass multiple values for an explicit sweep. | `16` |
 | `--output-dir PATH` | Parent of the timestamped directory this run writes. | `output/` |
 | `--resume STAMP` | Continue an interrupted run: the name of its directory under `--output-dir`. Cells already checkpointed there are skipped and the rest are written into the same directory. The config and grid are read from that run's manifest, so no other flag is needed; any that is given layers on top and must still match what the run recorded. | off |
 
@@ -110,7 +112,7 @@ Every column is documented in `METHODOLOGY.md` §8.
 ```text
 output/20260904T083556Z/
 ├── per_step/
-│   ├── e0.1_d1.0_w16.parquet     every bootstrap run of that cell
+│   ├── e0.1_d1.0_p16.parquet     every resampled run of that cell
 │   └── ...                       one part per grid cell
 ├── scenario_summary.csv
 ├── replay_outcome_summary.csv

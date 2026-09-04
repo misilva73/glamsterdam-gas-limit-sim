@@ -21,10 +21,11 @@ It combines two historical inputs:
 2. Historical block headers, used for base-fee initialization and to anchor each
    source block's observed demand to its historical price.
 
-Transactions arrive in source-block cohorts resampled in contiguous windows with
-a moving-block bootstrap.
-An isoelastic demand curve changes the quantity arriving as the simulated price
-changes. Pending transactions are ordered by effective tip and greedily included
+An isoelastic demand curve sets how much gas arrives each block, measured
+against one fixed reference price for the whole trace. Which transactions make up
+that gas is resampled from a contiguous **composition pool** of source blocks,
+redrawn independently every step.
+ Pending transactions are ordered by effective tip and greedily included
 only when they fit both execution-gas and state-gas capacity.
 
 For each simulated block, the engine does this:
@@ -82,7 +83,7 @@ load, validate, derive gas dimensions, cache
                   ↓
 group transactions into source-block cohorts
                   ↓
-construct a moving-block-bootstrap arrival path
+draw one composition pool per simulated step
                   ↓
 simulate demand, mempool, block fill, gas limit, and base fee
                   ↓
@@ -157,8 +158,8 @@ Credentials live in gitignored `secrets.json`; see `README.md` for setup.
 There is no production offline-data branch. Tests inject synthetic replay rows and
 headers at the two network seams. The fixtures exercise autocorrelation, fee
 ineligibility, calldata-floor binding, and state-gas saturation, but they are not
-evidence about mainnet. In particular, any bootstrap window inferred from the
-synthetic trace must be re-derived on real data.
+evidence about mainnet. In particular, no composition-pool width inferred
+from the synthetic trace carries over to real data.
 
 ### 3.4 Caching and provenance
 
@@ -241,7 +242,7 @@ never a capacity input.
 ### 4.3 Configuration and grid
 
 Fixed run parameters live in `config.SimConfig`; one cell's elasticity, demand
-level, and bootstrap window live in `config.Scenario`; their swept axes live in
+level, and composition-pool width live in `config.Scenario`; their swept axes live in
 `config.SimulationGrid`. `README.md` is the complete flag reference, and every
 resolved value is written to `manifest.json`.
 
@@ -253,12 +254,12 @@ Key defaults are:
 | ramp rate | current limit ÷ 1024 per block |
 | elasticities | 0.1, 0.2, 0.3 |
 | demand levels | 1, 1.5, 2 |
-| bootstrap window | 32 cohorts |
-| bootstrap runs per cell | 20 |
-| price EMA span | 300 blocks |
+| composition pool | 16 cohorts |
+| resampled runs per cell | 20 |
+| price EMA span | 200 blocks |
 | price-response bounds | 0.05, 20 |
 
-The defaults form 9 grid cells before repeated bootstrap runs.
+The defaults form 9 grid cells before repeated runs.
 High-demand cells dominate runtime because each block scans a growing mempool.
 
 ## 5. Workload model
@@ -271,30 +272,45 @@ offsets.
 
 Cohorts are positional and may skip block numbers: if filtering removes every
 transaction in a block, no empty cohort is created. Transaction identity after
-sampling is `(run_index, window_instance, source_block_number, tx_index,
+sampling is `(run_index, simulation_position, source_block_number, tx_index,
 replica_index)`; hashes are omitted from the hot path to save memory.
 
-### 5.2 Arrival paths
+### 5.2 Composition pools
 
-The simulation draws window starts uniformly with replacement, copies
-`L` contiguous cohorts from each start, and truncates the concatenated path to the
-horizon. Windows do not wrap around the trace. Each occurrence has a unique
-`window_instance`.
+Every simulated step draws its own pool: a start index uniform over the trace,
+then the `L = composition_pool_blocks` contiguous cohorts from there. Draws are
+independent across steps and taken with replacement, so pools repeat and overlap
+freely, and pools do not wrap around the trace -- the last `L - 1` cohorts
+therefore appear in fewer pools than mid-trace ones.
 
-Run `k` uses the same bootstrap windows in every demand scenario. These common
-random numbers make scenario differences reflect parameters rather than different
-window draws.
+**A pool supplies composition only.** It sets which transactions a step's gas is
+made of; it sets neither how much gas arrives (section 6.1) nor the price that
+demand is measured against (section 6.2). Because starts are independent, nothing
+about a step's arrivals depends on the step before it: this is not a moving-block
+bootstrap, and none of the trace's own autocorrelation survives into the arrival
+process. All persistence in a run comes from the simulator's own state -- mempool
+backlog, base fee, and the price EMA.
 
-### 5.3 Choosing the bootstrap length `L`
+Run `k` uses the same pool draws in every demand scenario. These common random
+numbers make scenario differences reflect parameters rather than different draws.
 
-`L` must be long enough to carry the dependence that matters -- congestion persists
-across blocks, so cohort size, gas mix, and fee level are all autocorrelated -- and
-short enough that resampling still produces genuinely new paths.
+### 5.3 Choosing the pool width `L`
 
-The default is `L = 32`, keeping the ordinary run focused on the two substantive
-demand axes. Pass multiple values such as `--window-blocks 16 32 64` for a
-separate robustness sweep. A conclusion that holds at all three does not depend
-on the choice; one that does not is a finding about `L`, not about the gas limit.
+Contiguity is what `L` buys, and its justification is *local coherence*, not
+dependence: neighbouring blocks share a fee regime and a gas mix, so a contiguous
+pool is a plausible slice of real demand, where sampling the whole trace at once
+would blend regimes months apart into a mix that never existed. `L` therefore has
+to be wide enough to hold more variety than a single block and narrow enough to
+stay inside one regime.
+
+The default is `L = 16`, keeping the ordinary run focused on the two substantive
+demand axes. Pass multiple values such as `--pool-blocks 8 16 64` for a separate
+robustness sweep. A conclusion that holds at all three does not depend on the
+choice; one that does not is a finding about `L`, not about the gas limit.
+
+`L` no longer trades off against path novelty, because it no longer governs how
+much history a path replays in order -- every step is an independent draw at any
+`L`.
 
 An earlier version reported an autocorrelation-based suggestion per run. It was
 dropped because it never fed the simulation. The default remains a modelling
@@ -305,34 +321,37 @@ much conclusions depend on it.
 
 ### 6.1 Quantity response
 
-For an arriving cohort:
+Every step, against a reference point fixed for the whole run:
 
 ```text
 price_response = clamp(
-    (price_signal / cohort_anchor_price) ** -aggregate_elasticity,
+    (price_signal / demand_anchor_price) ** -aggregate_elasticity,
     lower_bound,
     upper_bound,
 )
 
 realized_demand_multiplier = demand_level * price_response
-gas_target = realized_demand_multiplier * cohort_total_gas
+gas_target = realized_demand_multiplier * reference_gas
 ```
 
-where:
+The reference pair is `(demand_anchor_price, reference_gas)` from section 6.2.
+Both are trace-level constants, so `realized_demand_multiplier` moves with the
+simulated price signal and with nothing else -- in particular not with which
+composition pool the step drew.
 
 ```text
-cohort_total_gas = Σ(execution_gas + state_gas)
+reference_gas = mean over cohorts of Σ(execution_gas + state_gas)
 ```
 
-The sum is deliberate: it is the historical metering basis on which the
-elasticity estimates were calibrated. It is not the block-capacity measure
-`max(execution, state)`.
+The `execution + state` sum is deliberate: it is the historical metering basis on
+which the elasticity estimates were calibrated. It is not the block-capacity
+measure `max(execution, state)`.
 
-`demand_level` sets latent demand at the anchor price. It represents secular
-growth and demand missing from an included-only trace. `aggregate_elasticity`
-sets how quantity responds to price. With elasticity zero, the multiplier is
-always `demand_level`, although cohorts remain anchored because the engine has
-one unconditional input contract.
+`demand_level` sets latent demand at the reference price, so `demand_level = 1`
+is one trace-average block's worth of gas per step. It represents secular growth
+and demand missing from an included-only trace. `aggregate_elasticity` sets how
+quantity responds to price; at elasticity zero the multiplier is always
+`demand_level`.
 
 The default elasticity grid is round values bracketing the central estimate
 0.175 and event-based range 0.10–0.28 in the
@@ -340,7 +359,7 @@ The default elasticity grid is round values bracketing the central estimate
 This model uses one aggregate elasticity, so it cannot model substitution between
 execution and state demand.
 
-### 6.2 Price signal and anchor
+### 6.2 Price signal and reference point
 
 Demand reacts to an exponentially smoothed effective price:
 
@@ -355,28 +374,48 @@ block and is carried forward across empty blocks. Effective price is used instea
 of base fee alone because tips dominate near the base-fee floor. The EMA dampens
 per-block EIP-1559 noise and a high-gain feedback loop.
 
-Each cohort's anchor price is:
+The reference price the demand curve is anchored at is one number for the whole
+trace:
 
 ```text
-source block base fee + historical gas-weighted mean realized tip
+demand_anchor_price = Σ(anchor_base_fee + realized_tip) * gas / Σ gas
 ```
 
-The historical and simulated tips use the same `schedule_gas_used` weighting.
-The price signal is seeded at the first arriving cohort's anchor, so **step 0's**
-multiplier is exactly `demand_level`, regardless of the configured starting base
-fee. Later steps are not fixed at their anchors; the simulated feedback loop
-determines their multipliers.
+gas-weighted over every transaction by `schedule_gas_used`, so it is on exactly
+the basis the simulated `priority_fees_wei / sender_gas_used` is measured on. The
+weighting is over *transactions*, not an average of per-cohort anchors: a 30M-gas
+block supplies six times the gas of a 5M-gas one and has to count for six times
+as much.
+
+An isoelastic curve is only a curve relative to a reference point, which is why
+this is a constant. Anchoring each step on its own sampled history would put a
+different curve under every step and move the multiplier for reasons no modelled
+quantity produced.
+
+The price signal is seeded at `demand_anchor_price`, so **step 0's** multiplier is
+exactly `demand_level` regardless of the configured starting base fee -- and,
+since the reference does not move, it stays there until the simulated price
+actually leaves the historical average. The running tip estimate is seeded from
+the tip half of the same reference.
 
 ### 6.3 Sampling arrivals
 
-For multiplier `m`, arrivals contain:
+A step's whole arrival is sampled: transactions are drawn **uniformly with
+replacement from the step's composition pool** until their accumulated
+`execution_gas + state_gas` crosses `gas_target`.
 
-1. `floor(m)` complete copies of the arriving cohort;
-2. a fractional remainder sampled uniformly with replacement until its accumulated
-   `execution_gas + state_gas` crosses the remaining gas target.
+Draws are uniform rather than gas-weighted so that the pool's own gas
+distribution is reproduced; weighting by gas would over-represent large
+transactions and reshape the very mix the pool exists to supply.
 
-The crossing transaction is retained, so the target may be exceeded by at most
-one sampled transaction. Remainders are sampled from the current bootstrap window.
+The crossing transaction is retained, so arrivals exceed the target by at most one
+transaction. That biases arrived gas slightly *up*, proportionally more so for a
+small target.
+
+Nothing is copied wholesale, so a step's transaction mix is a fresh random sample
+rather than a real block plus a sampled margin. Single-path series of
+`arrived_tx_count` and the gas mix are correspondingly noisy; the signal is in the
+aggregates across runs.
 
 Arrivals are sorted by source position and replica index before admission. This
 preserves the engine's deterministic append-only mempool order.
@@ -487,7 +526,7 @@ dynamic-fee tip = min(
 ```
 
 Eligible items sort by effective tip descending, then by ascending
-`(arrival_step, window_instance, source_block_number, tx_index, replica_index)`.
+`(arrival_step, source_block_number, tx_index, replica_index)`.
 The implementation uses stable tip sorting and tip-value tranches, but these are
 exact performance optimizations, not approximations.
 
@@ -549,13 +588,13 @@ the master seed and its run index, not from the order cells were executed in.
 ### 8.1 Per-step data
 
 Per-step data is a directory of parquet parts, `per_step/<cell>.parquet` — one
-part per grid cell, holding every bootstrap run of that cell:
+part per grid cell, holding every resampled run of that cell:
 
 ```text
-per_step/e0.175_d1.5_w32.parquet     runs 0..num_bootstrap_runs-1
+per_step/e0.175_d1.5_p16.parquet     runs 0..num_bootstrap_runs-1
 ```
 
-The cell stem is `e<aggregate_elasticity>_d<demand_level>_w<bootstrap_window_blocks>`,
+The cell stem is `e<aggregate_elasticity>_d<demand_level>_p<composition_pool_blocks>`,
 each float rendered as its shortest round-tripping form so distinct axis values
 cannot collide into one part.
 
@@ -570,8 +609,8 @@ small summaries stay CSV because they are meant to be read directly.
 
 | Group | Columns |
 | --- | --- |
-| identity | `run_index`, `aggregate_elasticity`, `demand_level`, `bootstrap_window_blocks`, `simulation_position`, `source_block_number` |
-| demand | `demand_price_signal`, `cohort_anchor_price`, `realized_demand_multiplier`, `demand_multiplier_clamped` |
+| identity | `run_index`, `aggregate_elasticity`, `demand_level`, `composition_pool_blocks`, `simulation_position`, `pool_start_block` |
+| demand | `demand_price_signal`, `demand_anchor_price`, `realized_demand_multiplier`, `demand_multiplier_clamped` |
 | capacity | `base_fee_per_gas`, `base_fee_clamped`, `gas_limit`, `block_execution_gas_used`, `block_state_gas_used` |
 | included | `included_tx_count`, `sender_gas_used`, `priority_fees_wei` |
 | arrivals | `arrived_tx_count`, `arrived_execution_gas`, `arrived_state_gas` |
@@ -583,12 +622,18 @@ Units are wei and gas unless a name states otherwise. `priority_fees_wei` is
 Exact derived quantities are intentionally not stored: `gas_used` is the maximum
 of the two block-gas columns; utilization divides either by `gas_limit`; the
 bottleneck compares them; fee-ineligible backlog subtracts eligible from total;
-and bootstrap window coordinates follow from `simulation_position` and `L`.
+and the pool's cohort span follows from `pool_start_block` and `L`.
+
+`pool_start_block` identifies the *draw*, not the arrivals: a step's transactions
+come from anywhere in its pool, and are reproducible from `run_index` plus the
+recorded seeds rather than from this column. `demand_anchor_price` is constant
+within a run and carried per row anyway, so a part reads back interpretably
+without its manifest.
 
 ### 8.2 Scenario summary
 
 `scenario_summary.csv` groups by `aggregate_elasticity`, `demand_level`, and
-`bootstrap_window_blocks` — one row per part file, appended in grid order as each
+`composition_pool_blocks` — one row per part file, appended in grid order as each
 cell is checkpointed. Its metrics are
 `execution_saturated_share`, `state_saturated_share`,
 `median_demand_multiplier`, `max_demand_multiplier`,
@@ -652,13 +697,14 @@ State these whenever reporting results from this repository.
 
 ### Read comparisons, not isolated cells
 
-- `demand_level` changes latent quantity at the anchor price.
+- `demand_level` changes latent quantity at the reference price.
 - `aggregate_elasticity` changes sensitivity to price. Zero is not swept: with no
   feedback and bid adaptation on, demand cannot be shed at `demand_level > 1` and
   the base fee runs to `MAX_BASE_FEE` (§7.2). It remains available as a
   single-scenario setting, where `demand_level <= 1` keeps it meaningful.
-- `L` changes which dependence structure the bootstrap preserves. If conclusions
-  change across `L`, the dependence structure is doing the work, not the gas limit.
+- `L` changes how wide a slice of history each step's transaction mix is drawn
+  from. If conclusions change across `L`, the composition of demand is doing the
+  work, not the gas limit.
 
 Execution and state utilisation share a denominator and do not add to 100%.
 Compare the two block-gas columns or the saturation shares to learn which resource
@@ -672,7 +718,7 @@ senders raising their signed gas limits.
 - Under a stated demand level and elasticity, how do base fee and backlog evolve?
 - Does eligible backlog clear while the gas limit ramps?
 - Under the observed transaction mix, how often does state or execution bind?
-- Which conclusions are robust across demand assumptions and bootstrap windows?
+- Which conclusions are robust across demand assumptions and pool widths?
 
 ### Unsupported questions
 
@@ -683,8 +729,8 @@ senders raising their signed gas limits.
 
 ## 11. Reproducibility
 
-- One master seed deterministically derives independent bootstrap and demand
-  streams. Bootstrap run `k` is shared across scenarios.
+- One master seed deterministically derives independent pool-draw and
+  demand-sampling streams. Run `k`'s pool draws are shared across scenarios.
 - Inclusion order is fully specified, and performance optimizations are tested
   against literal sequential implementations.
 - Dataset fields and block range are pinned and stored in cache provenance. Keep

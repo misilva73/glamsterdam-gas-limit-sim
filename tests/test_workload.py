@@ -14,8 +14,8 @@ from sim.metrics import effective_tip
 from sim.workload import (
     PATH_COLUMNS,
     adapt_bids,
-    bootstrap_path,
     build_cohorts,
+    composition_pools,
     demand_multiplier,
     demand_pool_bounds,
     sample_arrivals,
@@ -29,7 +29,7 @@ def scenario(**overrides) -> Scenario:
         **{
             "aggregate_elasticity": 0.175,
             "demand_level": 1.0,
-            "bootstrap_window_blocks": 32,
+            "composition_pool_blocks": 16,
             **overrides,
         }
     )
@@ -138,6 +138,81 @@ def test_anchor_matches_the_realized_tip_definition_used_on_the_simulated_side(
         assert priced_cohorts.anchor_price[index] == pytest.approx(expected)
 
 
+def test_the_demand_reference_is_gas_weighted_over_transactions_not_cohorts():
+    """Two blocks of very different size: the big one must dominate the price."""
+    frame = pd.DataFrame(
+        {
+            "block_number": [100, 200],
+            "tx_index": [0, 0],
+            "tx_type": [2, 2],
+            "max_fee_per_gas": [100 * GWEI, 100 * GWEI],
+            "max_priority_fee_per_gas": [GWEI, GWEI],
+            "execution_gas": [1_000_000, 9_000_000],
+            "state_gas": [0, 0],
+            "schedule_gas_used": [1_000_000, 9_000_000],
+        }
+    )
+    headers = pd.DataFrame(
+        {"block_number": [100, 200], "base_fee_per_gas": [10 * GWEI, 20 * GWEI]}
+    )
+
+    reference = build_cohorts(frame, headers).reference
+
+    # Base fees of 10 and 20 gwei weighted 1M:9M give 19 gwei, plus a flat 1 gwei
+    # tip. An unweighted cohort mean would have said 15 + 1 = 16 gwei.
+    assert reference.price == pytest.approx(20 * GWEI)
+    assert reference.tip == pytest.approx(GWEI)
+    # Mean cohort S + B gas across the two blocks.
+    assert reference.gas == pytest.approx(5_000_000)
+
+
+def test_the_reference_price_is_the_gas_weighted_mean_of_the_cohort_anchors(
+    priced_cohorts,
+):
+    """`DemandReference.price` must stay on the `priority_fees_wei / gas` basis."""
+    columns = priced_cohorts.columns
+    tip = np.clip(
+        effective_tip(
+            columns["tx_type"],
+            columns["max_fee_per_gas"],
+            columns["max_priority_fee_per_gas"],
+            columns["anchor_base_fee"],
+        ),
+        0,
+        None,
+    )
+    weight = columns["schedule_gas_used"].astype(np.float64)
+    expected = ((columns["anchor_base_fee"] + tip) * weight).sum() / weight.sum()
+
+    assert priced_cohorts.reference.price == pytest.approx(expected)
+
+
+def test_a_trace_with_no_sender_gas_has_no_observable_reference_price():
+    frame = pd.DataFrame(
+        {
+            "block_number": [100],
+            "tx_index": [0],
+            "tx_type": [2],
+            "max_fee_per_gas": [100 * GWEI],
+            "max_priority_fee_per_gas": [GWEI],
+            "execution_gas": [0],
+            "state_gas": [0],
+            "schedule_gas_used": [0],
+        }
+    )
+    headers = pd.DataFrame({"block_number": [100], "base_fee_per_gas": [10 * GWEI]})
+
+    reference = build_cohorts(frame, headers).reference
+
+    # No weight to average over, so there is no price to anchor on;
+    # `demand_multiplier` reads a 0 anchor as "flat at the demand level".
+    assert (reference.price, reference.tip, reference.gas) == (0.0, 0.0, 0.0)
+    assert demand_multiplier(DEFAULT_CONFIG, scenario(demand_level=2.0), GWEI, 0.0) == (
+        2.0,
+        False,
+    )
+
+
 def test_missing_headers_for_a_cohort_block_are_refused():
     raw = dummy_tx_gas_results(num_blocks=10, seed=5)
     headers = dummy_block_headers(raw).iloc[2:]
@@ -228,135 +303,137 @@ def test_a_non_positive_price_or_anchor_falls_back_to_the_level():
 # --- Arrival paths ----------------------------------------------------------------
 
 
-def test_bootstrap_path_never_wraps_and_preserves_within_window_order(cohorts):
-    horizon, window = 100, 16
-    path = bootstrap_path(cohorts, horizon, window, np.random.default_rng(1))
+def test_every_step_draws_its_own_pool_and_none_of_them_wrap(cohorts):
+    horizon, pool_blocks = 100, 16
+    path = composition_pools(cohorts, horizon, pool_blocks, np.random.default_rng(1))
 
     assert tuple(path.columns) == PATH_COLUMNS
     assert len(path) == horizon
     assert path["simulation_position"].tolist() == list(range(horizon))
-    assert path["cohort_index"].max() < len(cohorts)
-
-    windows = path.groupby("window_instance")["cohort_index"]
-    assert windows.ngroups == -(-horizon // window)
-    for _, indices in windows:
-        assert (np.diff(indices.to_numpy()) == 1).all()
-        assert indices.max() < len(cohorts)  # a window that wrapped would restart at 0
-    assert (windows.size() <= window).all()
-    # A window instance is unique per sampled occurrence, so a repeated start
-    # index still gets its own instance id.
-    assert path["window_instance"].nunique() == windows.ngroups
+    # One start per step, and every pool fits inside the trace without wrapping.
+    starts = path["pool_start_index"].to_numpy()
+    assert starts.min() >= 0
+    assert starts.max() + pool_blocks <= len(cohorts)
+    assert (path["pool_start_block"].to_numpy() == cohorts.block_numbers[starts]).all()
 
 
-def test_bootstrap_path_is_reproducible_from_its_seed(cohorts):
-    kwargs = dict(cohorts=cohorts, horizon=64, window_blocks=32)
-    same = bootstrap_path(**kwargs, rng=np.random.default_rng(7))
-    again = bootstrap_path(**kwargs, rng=np.random.default_rng(7))
-    other = bootstrap_path(**kwargs, rng=np.random.default_rng(8))
+def test_pool_starts_are_independent_across_steps(cohorts):
+    """Not a moving-block bootstrap: no step's pool follows on from the last."""
+    path = composition_pools(cohorts, 400, 16, np.random.default_rng(5))
+    starts = path["pool_start_index"].to_numpy()
+
+    # Consecutive draws are unrelated, so steps almost never continue each other
+    # and the draws spread over the whole legal range.
+    assert (np.diff(starts) == 16).mean() < 0.05
+    assert starts.max() - starts.min() > 0.5 * (len(cohorts) - 16)
+    assert np.unique(starts).size > 20
+
+
+def test_composition_pools_are_reproducible_from_the_seed(cohorts):
+    kwargs = dict(cohorts=cohorts, horizon=64, pool_blocks=32)
+    same = composition_pools(**kwargs, rng=np.random.default_rng(7))
+    again = composition_pools(**kwargs, rng=np.random.default_rng(7))
+    other = composition_pools(**kwargs, rng=np.random.default_rng(8))
 
     pd.testing.assert_frame_equal(same, again)
-    assert not same["cohort_index"].equals(other["cohort_index"])
+    assert not same["pool_start_index"].equals(other["pool_start_index"])
 
 
-def test_bootstrap_window_cannot_exceed_the_source_trace(cohorts):
+def test_a_shorter_horizon_is_a_prefix_of_a_longer_one(cohorts):
+    """One draw per step, so halving the horizon just stops the same run early."""
+    long = composition_pools(cohorts, 80, 16, np.random.default_rng(3))
+    short = composition_pools(cohorts, 40, 16, np.random.default_rng(3))
+
+    assert short["pool_start_index"].tolist() == long["pool_start_index"].tolist()[:40]
+
+
+def test_a_pool_cannot_exceed_the_source_trace(cohorts):
     with pytest.raises(ValueError, match="exceeds"):
-        bootstrap_path(cohorts, 10, len(cohorts) + 1, np.random.default_rng(0))
+        composition_pools(cohorts, 10, len(cohorts) + 1, np.random.default_rng(0))
 
 
 # --- Sampling pools ---------------------------------------------------------------
 
 
-def test_bootstrap_pool_is_exactly_the_step_s_own_window(cohorts):
-    window = 16
-    path = bootstrap_path(cohorts, 64, window, np.random.default_rng(2))
-    low, high = demand_pool_bounds(cohorts, path)
+def test_pool_bounds_are_the_contiguous_cohort_run_from_the_step_s_start(cohorts):
+    pool_blocks = 16
+    path = composition_pools(cohorts, 64, pool_blocks, np.random.default_rng(2))
+    low, high = demand_pool_bounds(cohorts, path, pool_blocks)
 
     for position in range(len(path)):
-        instance = path.loc[position, "window_instance"]
-        members = path.loc[path["window_instance"] == instance, "cohort_index"]
-        assert low[position] == cohorts.offsets[members.min()]
-        assert high[position] == cohorts.offsets[members.max() + 1]
-        # Every step in a window shares one pool, and the arriving cohort is in it.
-        assert low[position] <= cohorts.offsets[path.loc[position, "cohort_index"]]
+        start = int(path.loc[position, "pool_start_index"])
+        assert low[position] == cohorts.offsets[start]
+        assert high[position] == cohorts.offsets[start + pool_blocks]
 
 
 # --- Arrival sampling -------------------------------------------------------------
 
 
-def test_unit_multiplier_is_exactly_the_source_cohort(cohorts):
-    cohort = cohorts.cohort(4)
-    arrivals = sample_arrivals(cohorts, 4, (0, len(cohorts)), 1.0, np.random.default_rng(0))
-
-    assert (arrivals["replica_index"] == 0).all()
-    assert (arrivals["execution_gas"] == cohort["execution_gas"]).all()
-    assert (arrivals["tx_index"] == cohort["tx_index"]).all()
-
-
-def test_integer_multiplier_replicates_every_transaction_exactly(cohorts):
-    cohort = cohorts.cohort(0)
-    size = cohort["tx_index"].size
-    arrivals = sample_arrivals(cohorts, 0, (0, 10), 3.0, np.random.default_rng(0))
-
-    assert arrivals["tx_index"].size == 3 * size
-    assert arrivals["replica_index"].tolist() == np.tile([0, 1, 2], size).tolist()
-    assert (arrivals["max_fee_per_gas"] == np.repeat(cohort["max_fee_per_gas"], 3)).all()
-    assert (arrivals["tx_index"] == np.repeat(cohort["tx_index"], 3)).all()
-
-
-def arrived_gas(cohorts, cohort_index, pool, multiplier, rng, draws):
+def arrived_gas(cohorts, pool, gas_target, rng, draws):
     """Total S + B gas arriving over repeated draws of one step."""
     totals = []
     for _ in range(draws):
-        arrivals = sample_arrivals(cohorts, cohort_index, pool, multiplier, rng)
+        arrivals = sample_arrivals(cohorts, pool, gas_target, rng)
         totals.append(int(arrivals["execution_gas"].sum() + arrivals["state_gas"].sum()))
     return totals
 
 
-def test_fractional_multiplier_hits_its_gas_target_in_expectation(cohorts):
+@pytest.mark.parametrize("scale", [0.5, 1.0, 2.5])
+def test_arrivals_hit_their_gas_target_in_expectation(cohorts, scale):
+    """The demand model sets the quantity, so the *gas* is what lands on target."""
     pool = (0, int(cohorts.offsets[20]))
-    target = 1.5 * cohorts.cohort_total_gas(0)
+    target = scale * cohorts.reference.gas
     rng = np.random.default_rng(11)
 
-    sampled = arrived_gas(cohorts, 0, pool, 1.5, rng, draws=200)
+    sampled = arrived_gas(cohorts, pool, target, rng, draws=200)
+    largest = int(cohorts.total_gas[pool[0] : pool[1]].max())
 
-    # Gas-based, so it is the *gas* that lands on target; the transaction count
-    # is not fixed and varies draw to draw.
-    assert np.mean(sampled) == pytest.approx(target, rel=0.02)
-    # The crossing draw is always kept, so no sample undershoots by more than
-    # the single largest transaction the pool could have contributed.
-    assert min(sampled) >= target - int(cohorts.total_gas[pool[0] : pool[1]].max())
-
-
-def test_sub_unit_multiplier_thins_the_cohort_by_gas(cohorts):
-    pool = (0, int(cohorts.offsets[20]))
-    target = 0.5 * cohorts.cohort_total_gas(0)
-    rng = np.random.default_rng(2)
-
-    sampled = arrived_gas(cohorts, 0, pool, 0.5, rng, draws=200)
-
-    assert np.mean(sampled) == pytest.approx(target, rel=0.03)
-    assert min(sampled) > 0
+    # The transaction count is not fixed and varies draw to draw.
+    assert np.mean(sampled) == pytest.approx(target, rel=0.05)
+    # Keeping the crossing draw biases arrivals *up* by part of one transaction,
+    # so the mean sits just above target -- proportionally more so for a small
+    # target, which is why the tolerance above is not tighter.
+    assert 0 <= np.mean(sampled) - target < largest
+    # And no individual sample undershoots by more than that same one draw.
+    assert min(sampled) >= target - largest
 
 
-def test_the_sampled_remainder_is_drawn_from_the_whole_window_not_just_the_cohort(cohorts):
+def test_a_non_positive_gas_target_arrives_nothing(cohorts):
+    arrivals = sample_arrivals(cohorts, (0, 100), 0.0, np.random.default_rng(1))
+
+    assert arrivals["tx_index"].size == 0
+    assert arrivals["replica_index"].size == 0
+
+
+def test_arrivals_are_drawn_from_the_whole_pool(cohorts):
+    """Composition comes from the pool, never from one privileged cohort."""
     pool = (int(cohorts.offsets[0]), int(cohorts.offsets[12]))
     rng = np.random.default_rng(4)
 
-    arrivals = sample_arrivals(cohorts, 3, pool, 1.5, rng)
+    arrivals = sample_arrivals(cohorts, pool, 3 * cohorts.reference.gas, rng)
     blocks = set(arrivals["source_block_number"].tolist())
 
     assert len(blocks) > 1
     assert blocks <= set(cohorts.block_numbers[:12].tolist())
-    # The whole copy still comes from the arriving cohort alone.
-    assert cohorts.block_numbers[3] in blocks
+
+
+def test_arrivals_never_come_from_outside_the_pool(cohorts):
+    pool = (int(cohorts.offsets[30]), int(cohorts.offsets[34]))
+    arrivals = sample_arrivals(
+        cohorts, pool, 5 * cohorts.reference.gas, np.random.default_rng(12)
+    )
+
+    assert set(arrivals["source_block_number"].tolist()) <= set(
+        cohorts.block_numbers[30:34].tolist()
+    )
 
 
 def test_arrivals_are_emitted_in_the_inclusion_tiebreak_order(cohorts):
     """`sim.engine`'s append-only mempool depends on this ordering."""
     rng = np.random.default_rng(6)
-    for multiplier in (0.4, 1.0, 2.7):
+    for scale in (0.4, 1.0, 2.7):
         arrivals = sample_arrivals(
-            cohorts, 5, (0, int(cohorts.offsets[15])), multiplier, rng
+            cohorts, (0, int(cohorts.offsets[15])), scale * cohorts.reference.gas, rng
         )
         key = np.stack(
             [
@@ -377,9 +454,10 @@ def test_arrivals_are_emitted_in_the_inclusion_tiebreak_order(cohorts):
 
 def test_sampling_is_reproducible_from_its_generator(cohorts):
     pool = (0, int(cohorts.offsets[10]))
-    same = sample_arrivals(cohorts, 1, pool, 2.3, np.random.default_rng(9))
-    again = sample_arrivals(cohorts, 1, pool, 2.3, np.random.default_rng(9))
-    other = sample_arrivals(cohorts, 1, pool, 2.3, np.random.default_rng(10))
+    target = 2.3 * cohorts.reference.gas
+    same = sample_arrivals(cohorts, pool, target, np.random.default_rng(9))
+    again = sample_arrivals(cohorts, pool, target, np.random.default_rng(9))
+    other = sample_arrivals(cohorts, pool, target, np.random.default_rng(10))
 
     assert (same["tx_index"] == again["tx_index"]).all()
     assert same["tx_index"].size != other["tx_index"].size or not (
@@ -463,7 +541,9 @@ def test_adaptation_saturates_instead_of_overflowing_int64():
 
 def test_adaptation_leaves_every_other_field_alone(cohorts):
     priced = anchored_cohorts(num_blocks=20, seed=8)
-    arrivals = sample_arrivals(priced, 2, (0, int(priced.offsets[5])), 1.0, np.random.default_rng(0))
+    arrivals = sample_arrivals(
+        priced, (0, int(priced.offsets[5])), priced.reference.gas, np.random.default_rng(0)
+    )
     adapted = adapt_bids(arrivals, base_fee=42 * GWEI)
 
     assert set(adapted) == set(arrivals)

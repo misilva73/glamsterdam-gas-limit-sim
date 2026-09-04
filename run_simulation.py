@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """Run a Fusaka -> Glamsterdam gas-limit simulation end to end.
 
-Sweeps the elasticity x demand-level x bootstrap-window grid, runs
-`num_bootstrap_runs` independent moving-block-bootstrap paths per cell, and
-writes the per-step data, the scenario summaries, and a run manifest.
+Sweeps the elasticity x demand-level x composition-pool grid, runs
+`num_bootstrap_runs` independent resampled paths per cell, and writes the
+per-step data, the scenario summaries, and a run manifest.
 
 Output is **checkpointed per grid cell**: when a cell finishes, its paths go to
 `per_step/<cell>.parquet` and its summary row is appended to
@@ -47,7 +47,7 @@ from data.load_tx_gas_results import (
 )
 from schemas import PER_STEP_COLUMNS
 from sim.engine import run_path
-from sim.workload import bootstrap_path, bootstrap_rng, build_cohorts
+from sim.workload import DemandReference, bootstrap_rng, build_cohorts, composition_pools
 
 PER_STEP_DIR = "per_step"
 SUMMARY_FILE = "scenario_summary.csv"
@@ -147,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="span of the EMA that smooths the effective gas price the demand model "
         "responds to; the elasticities are daily, so this should be hours not blocks "
-        "(default: 300)",
+        "(default: 200)",
     )
     demand.add_argument(
         "--multiplier-bounds",
@@ -187,12 +187,14 @@ def build_parser() -> argparse.ArgumentParser:
         "(default: 1 1.5 2)",
     )
     grid.add_argument(
-        "--window-blocks",
+        "--pool-blocks",
         nargs="+",
         type=int,
         metavar="L",
-        help="bootstrap axis: length in cohorts of each resampled window "
-        "(default: 32; pass multiple values for a robustness sweep)",
+        help="composition axis: how many contiguous source blocks each step draws "
+        "its transaction mix from. It sets the mix only -- the demand model sets "
+        "the quantity -- so this is a robustness knob, not an assumption "
+        "(default: 16; pass multiple values for a sweep)",
     )
     parser.add_argument(
         "--output-dir",
@@ -240,7 +242,7 @@ def build_grid(args: argparse.Namespace, base: SimulationGrid = SimulationGrid()
     overrides = {
         "aggregate_elasticities": tuple(args.elasticities) if args.elasticities else None,
         "demand_levels": tuple(args.demand_levels) if args.demand_levels else None,
-        "bootstrap_window_blocks": tuple(args.window_blocks) if args.window_blocks else None,
+        "composition_pool_blocks": tuple(args.pool_blocks) if args.pool_blocks else None,
     }
     return SimulationGrid(
         **{**asdict(base), **{k: v for k, v in overrides.items() if v is not None}}
@@ -280,14 +282,15 @@ def run_simulation(
         # the trace contains, not a filter applied to it.
         simulatable = derive_gas_dimensions(load_tx_gas_results(cfg))
         outcomes = replay_outcome_summary(simulatable)
-        # Headers first: the demand model anchors every cohort on the base fee of
-        # its own source block, so cohorts cannot be built without them.
+        # Headers first: every transaction reprices from the base fee of its own
+        # source block, and the demand reference is gas-weighted over all of
+        # them, so cohorts cannot be built without them.
         headers = fetch_headers(cfg, simulatable)
         cohorts = build_cohorts(simulatable, headers)
         base_fee = resolve_starting_base_fee(cfg, headers, simulatable)
 
     horizon = cfg.simulation_horizon_blocks or len(cohorts)
-    resolved = resolved_facts(cfg, horizon, base_fee)
+    resolved = resolved_facts(cfg, horizon, base_fee, cohorts.reference)
 
     if resumed is None:
         run_dir, done, summaries = new_run_dir(cfg.output_dir), 0, []
@@ -330,7 +333,7 @@ def run_simulation(
                     cell_slug(
                         scenario.aggregate_elasticity,
                         scenario.demand_level,
-                        scenario.bootstrap_window_blocks,
+                        scenario.composition_pool_blocks,
                     ),
                     frames,
                 )
@@ -356,10 +359,10 @@ def grid_cells(grid: SimulationGrid) -> list[Scenario]:
     sequentially, so what is on disk is always a prefix of this list.
     """
     cells = [
-        Scenario(elasticity, level, window)
+        Scenario(elasticity, level, pool_blocks)
         for elasticity in grid.aggregate_elasticities
         for level in grid.demand_levels
-        for window in grid.bootstrap_window_blocks
+        for pool_blocks in grid.composition_pool_blocks
     ]
     if not cells:
         raise ValueError("empty simulation grid: every axis needs at least one value")
@@ -374,16 +377,16 @@ def run_scenario(
     horizon: int,
     base_fee: int,
 ) -> list[pd.DataFrame]:
-    """Run the bootstrap samples for one grid cell."""
+    """Run the resampled paths for one grid cell."""
     return [
         run_path(
             cohorts,
-            # Common random numbers: the same window draw serves every
-            # demand scenario, so scenarios differ by demand alone.
-            bootstrap_path(
+            # Common random numbers: the same pool draws serve every demand
+            # scenario, so scenarios differ by demand alone.
+            composition_pools(
                 cohorts,
                 horizon,
-                scenario.bootstrap_window_blocks,
+                scenario.composition_pool_blocks,
                 bootstrap_rng(cfg, run_index),
             ),
             cfg,
@@ -398,7 +401,7 @@ def run_scenario(
 def fetch_headers(cfg: SimConfig, simulatable: pd.DataFrame) -> pd.DataFrame:
     """Headers covering every source block, plus the first cohort's parent.
 
-    Every cohort needs its own block's base fee for the demand anchor, and the
+    Every transaction needs its own block's base fee to reprice from, and the
     simulation additionally needs the block *before* its first cohort, whose
     base fee is where every path starts.
     """
@@ -422,7 +425,7 @@ def scenario_summary(per_step: pd.DataFrame) -> pd.DataFrame:
 
     "Terminal" is the last arrival step, which is where a path now ends.
     """
-    keys = ["aggregate_elasticity", "demand_level", "bootstrap_window_blocks"]
+    keys = ["aggregate_elasticity", "demand_level", "composition_pool_blocks"]
     flagged = per_step.assign(
         execution_saturated=(
             per_step["block_execution_gas_used"] / per_step["gas_limit"]
@@ -514,13 +517,13 @@ def checkpoint_cell(
     return summary
 
 
-def cell_slug(elasticity: float, level: float, window: int) -> str:
-    """Grid identity as a filename stem, e.g. `e0.175_d1.5_w32`.
+def cell_slug(elasticity: float, level: float, pool_blocks: int) -> str:
+    """Grid identity as a filename stem, e.g. `e0.175_d1.5_p32`.
 
     `repr` of a float is its shortest round-tripping form, so distinct axis values
     can never collide into one part file.
     """
-    return f"e{float(elasticity)!r}_d{float(level)!r}_w{int(window)}"
+    return f"e{float(elasticity)!r}_d{float(level)!r}_p{int(pool_blocks)}"
 
 
 def part_file(slug: str) -> str:
@@ -645,7 +648,7 @@ def completed_cells(run_dir: Path, cells: list[Scenario]) -> tuple[int, pd.DataF
         slug = cell_slug(
             scenario.aggregate_elasticity,
             scenario.demand_level,
-            scenario.bootstrap_window_blocks,
+            scenario.composition_pool_blocks,
         )
         if not (per_step_dir / part_file(slug)).exists():
             break
@@ -709,11 +712,21 @@ def require_resumable_trace(resumed: ResumedRun, resolved: dict) -> None:
 # --- Manifest ---------------------------------------------------------------
 
 
-def resolved_facts(cfg: SimConfig, horizon: int, base_fee: int) -> dict:
-    """What the run resolved from its inputs; also what `--resume` must match."""
+def resolved_facts(
+    cfg: SimConfig, horizon: int, base_fee: int, reference: DemandReference
+) -> dict:
+    """What the run resolved from its inputs; also what `--resume` must match.
+
+    The demand reference is in here because it is derived from the whole trace:
+    if the upstream table grew, the reference price and the mean cohort gas move
+    with it, and every cell already on disk was simulated against the old pair.
+    """
     return {
         "simulation_horizon_blocks": int(horizon),
         "starting_base_fee_wei": int(base_fee),
+        "demand_anchor_price_wei": float(reference.price),
+        "demand_reference_gas": float(reference.gas),
+        "demand_reference_tip_wei": float(reference.tip),
         "bootstrap_seed": cfg.bootstrap_seed,
         "demand_seed": cfg.demand_seed,
     }

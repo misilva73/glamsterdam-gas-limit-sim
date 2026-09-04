@@ -6,6 +6,11 @@ arrival step is the largest so far, and `sample_arrivals` emits
 `(source_block_number, tx_index, replica_index)` order within a step) and removals
 preserve relative order, so the full tie-break chain reduces to a *stable* sort
 on the tip alone.
+
+Arrivals here are entirely sampled, so a step's transaction mix is a fresh draw
+from its composition pool rather than a real block plus a sampled margin: single
+-path series of `arrived_tx_count` and the gas mix are correspondingly noisier
+than they were, and it is the aggregates across runs that carry the signal.
 """
 
 from __future__ import annotations
@@ -53,7 +58,7 @@ TIP_TRANCHE_SIZE = 16_384
 # more time copying; higher ones spend more time scanning dead entries.
 COMPACTION_DEAD_SHARE = 0.25
 
-_IDENTITY_INTEGERS = ("source_block_number",)
+_IDENTITY_INTEGERS = ("pool_start_block",)
 
 
 def run_path(
@@ -74,37 +79,44 @@ def run_path(
 
     Every path in a scenario starts from the same state -- empty mempool,
     `starting_base_fee`, `cfg.fusaka_gas_limit`, and a price signal seeded at the
-    first cohort's anchor -- and sampled cohorts never reset it, so bootstrap
-    spread reflects workload variation alone.
+    trace's reference price -- and sampled pools never reset it, so the spread
+    across runs reflects workload variation alone.
 
-    The demand model closes a loop the simulation did not previously have: the
-    base fee sets the price signal, the price signal sets how much demand
-    arrives, and that demand sets the next base fee. Everything that feeds the
-    loop is *parent-derived*, so within a step the multiplier is computed from
-    the price signal as it stood before this block was built, and the signal is
-    updated from the block's own outcome only afterwards.
+    Each step's arrivals are `multiplier * reference.gas` gas drawn from that
+    step's own composition pool. The demand model closes the loop: the base fee
+    sets the price signal, the price signal sets how much demand arrives, and
+    that demand sets the next base fee. Everything that feeds the loop is
+    *parent-derived*, so within a step the multiplier is computed from the price
+    signal as it stood before this block was built, and the signal is updated
+    from the block's own outcome only afterwards.
+
+    The demand *reference* is fixed for the whole run, so the multiplier moves
+    only with the simulated price -- never with which pool a step happened to
+    draw. See `sim.workload.DemandReference`.
     """
     rng = demand_rng(cfg, run_index)
-    cohort_index = path["cohort_index"].to_numpy(np.int64)
-    source_block_number = path["source_block_number"].to_numpy(np.int64)
-    pool_low, pool_high = demand_pool_bounds(cohorts, path)
+    reference = cohorts.reference
+    pool_start_block = path["pool_start_block"].to_numpy(np.int64)
+    pool_low, pool_high = demand_pool_bounds(
+        cohorts, path, scenario.composition_pool_blocks
+    )
 
     pool = Mempool()
     base_fee = int(starting_base_fee)
     gas_limit = int(cfg.fusaka_gas_limit)
     parent_gas_used: int | None = None
     backlog_execution_gas = backlog_state_gas = 0
-    # Seeding the signal at the first cohort's own anchor makes step 0's
-    # multiplier exactly `demand_level`, whatever `starting_base_fee` is: the
-    # sampled path begins at its first cohort's anchor. The tip estimate is
-    # seeded from the same cohort, so an empty first block does not drag the
-    # signal toward a tipless price it never actually saw.
-    anchor_price = cohorts.anchor_price[cohort_index]
-    price_signal = float(anchor_price[0]) if cohort_index.size else float(base_fee)
-    prevailing_tip = _seed_tip(cohorts, cohort_index)
+    # Seeding the signal at the reference price makes step 0's multiplier exactly
+    # `demand_level` whatever `starting_base_fee` is -- and, because the
+    # reference no longer moves, keeps it there until the simulated price
+    # actually leaves the historical average. The tip estimate is seeded from the
+    # same reference, so an empty first block does not drag the signal toward a
+    # tipless price the trace never showed.
+    price_signal = reference.price if reference.price > 0 else float(base_fee)
+    prevailing_tip = reference.tip
 
     records = []
-    for position in range(cohort_index.size):
+    for position in range(pool_start_block.size):
         # Both persistent-state updates are parent-derived, so position 0 reports
         # the configured initial state verbatim and the ramp first applies at
         # position 1. Glamsterdam is always active from step 0.
@@ -112,15 +124,13 @@ def run_path(
             base_fee = next_base_fee(base_fee, parent_gas_used, gas_limit)
             gas_limit = ramp_gas_limit(gas_limit, cfg.glamsterdam_gas_limit)
 
-        cohort_anchor = float(anchor_price[position])
         multiplier, clamped = demand_multiplier(
-            cfg, scenario, price_signal, cohort_anchor
+            cfg, scenario, price_signal, reference.price
         )
         arrivals = sample_arrivals(
             cohorts,
-            int(cohort_index[position]),
             (int(pool_low[position]), int(pool_high[position])),
-            multiplier,
+            multiplier * reference.gas,
             rng,
         )
         if cfg.adapt_bids:
@@ -145,9 +155,9 @@ def run_path(
                 scenario,
                 run_index=run_index,
                 simulation_position=position,
-                source_block_number=int(source_block_number[position]),
+                pool_start_block=int(pool_start_block[position]),
                 demand_price_signal=price_signal,
-                cohort_anchor_price=cohort_anchor,
+                demand_anchor_price=reference.price,
                 realized_demand_multiplier=multiplier,
                 demand_multiplier_clamped=clamped,
                 base_fee_per_gas=base_fee,
@@ -168,13 +178,6 @@ def run_path(
             price_signal, base_fee, prevailing_tip, cfg.price_ema_alpha
         )
     return _per_step_frame(records)
-
-
-def _seed_tip(cohorts: Cohorts, cohort_index: np.ndarray) -> float:
-    """The first cohort's realised mean tip, or 0 when there is nothing to go on."""
-    if cohort_index.size == 0:
-        return 0.0
-    return float(cohorts.anchor_tip[cohort_index[0]])
 
 
 # --- Mempool ----------------------------------------------------------------------
@@ -413,13 +416,13 @@ def fill_block(
 
 def _per_step_frame(records: list[dict]) -> pd.DataFrame:
     frame = pd.DataFrame.from_records(records, columns=list(PER_STEP_COLUMNS))
-    # Every step now arrives a cohort, so the identity columns are always present
-    # and the demand columns are always drawn -- no nullable dtypes needed.
+    # Every step draws a pool and a demand quantity, so the identity and demand
+    # columns are always present -- no nullable dtypes needed.
     dtypes = {name: np.int64 for name in _IDENTITY_INTEGERS}
     dtypes["demand_multiplier_clamped"] = bool
     dtypes["base_fee_clamped"] = bool
     dtypes["priority_fees_wei"] = "float64"  # can exceed int64; see _priority_fees_wei
-    dtypes["cohort_anchor_price"] = "float64"
+    dtypes["demand_anchor_price"] = "float64"
     dtypes["realized_demand_multiplier"] = "float64"
     dtypes["demand_price_signal"] = "float64"
     return frame.astype(dtypes)

@@ -1,19 +1,26 @@
-"""Arrival cohorts, bootstrap paths, and the price-responsive demand model.
+"""Arrival cohorts, composition pools, and the price-responsive demand model.
 
-The transactions historically included in source block `n` form one arrival
-cohort that becomes available at a single simulated step. Cohorts are held as
-flat numpy arrays plus per-cohort offsets rather than one frame per block: a full
-week is ~8M rows and the engine touches a cohort every step.
+The transactions historically included in source block `n` form one cohort.
+Cohorts are held as flat numpy arrays plus per-cohort offsets rather than one
+frame per block: a full week is ~8M rows and the engine touches a pool of them
+every step.
 
-A workload item is identified by `(run_index, window_instance, tx_hash,
-replica_index)`. `tx_hash` is deliberately *not* carried through expansion --
+**Quantity and composition are separated.** How much gas arrives at a step is set
+entirely by the isoelastic demand model (`demand_multiplier`) against a single
+fixed reference point for the whole trace (`DemandReference`). *Which*
+transactions make up that gas is drawn from a **composition pool**: a random
+contiguous run of `composition_pool_blocks` cohorts, redrawn independently every
+step. The pool sets the mix and nothing else -- it does not set the quantity, and
+consecutive steps are independent, so this is not a moving-block bootstrap and no
+historical autocorrelation survives it. Contiguity earns its place only by
+keeping each step's mix inside one stretch of one fee regime rather than smearing
+it across the whole trace. See `METHODOLOGY.md` section 6.
+
+A workload item is identified by `(run_index, simulation_position, tx_hash,
+replica_index)`. `tx_hash` is deliberately *not* carried through sampling --
 `(source_block_number, tx_index)` maps to it one-to-one and costs 16 bytes
 instead of a Python string -- so the engine never materialises the multiplied
 trace.
-
-How much demand arrives at a step is set by the isoelastic demand model
-(`demand_multiplier`), calibrated per cohort against the price at which that
-cohort was historically observed. See `METHODOLOGY.md` section 6.
 """
 
 from __future__ import annotations
@@ -41,10 +48,8 @@ COHORT_SOURCE_COLUMNS = (
 
 PATH_COLUMNS = (
     "simulation_position",
-    "cohort_index",
-    "source_block_number",
-    "window_instance",
-    "position_in_window",
+    "pool_start_index",
+    "pool_start_block",
 )
 
 _MAX_SAMPLING_BATCHES = 64
@@ -56,6 +61,32 @@ _INT64_FLOAT_CAP = float(np.nextafter(2.0**63, 0.0))
 `float64(int64_max)` rounds *up* to 2**63, which is out of range, so clipping a
 float to `int64_max` still produces an invalid cast. This is the value below it.
 """
+
+
+@dataclass(frozen=True)
+class DemandReference:
+    """The fixed `(price, quantity)` pair the demand curve is anchored at.
+
+    An isoelastic demand curve is only a curve relative to a reference point, so
+    both halves are single trace-level constants rather than per-step values:
+    "at price `price`, demand is `demand_level * gas` per block". That is what
+    makes `demand_level` mean something stable, and it makes
+    `realized_demand_multiplier` move with the *simulated* price and nothing
+    else. Anchoring on each step's own sampled history instead would put a
+    different curve under every step and inject noise that no modelled quantity
+    produced.
+
+    `price` is gas-weighted over every transaction in the trace, on the same
+    basis as the simulated `priority_fees_wei / sender_gas_used`: historical base
+    fee plus realised tip, weighted by sender-facing gas. `tip` is the tip half
+    of it alone, which seeds the engine's running tip estimate. `gas` is the mean
+    per-cohort `total_gas`, so `demand_level = 1` is one trace-average block's
+    worth of demand per step.
+    """
+
+    price: float
+    gas: float
+    tip: float
 
 
 @dataclass(frozen=True)
@@ -71,9 +102,11 @@ class Cohorts:
     not the simulator's capacity measure, which is `max(execution, state)` per
     block.
 
-    `anchor_price` is per cohort: the effective gas price at which that cohort's
-    demand was actually observed (its header base fee plus its realised
-    gas-weighted mean tip).
+    `anchor_price` and `anchor_tip` are per cohort: the effective gas price at
+    which that cohort's demand was actually observed, and the realised
+    gas-weighted mean tip inside it. The demand model reads neither -- it uses
+    the trace-level `reference` -- but they are what `reference` aggregates and
+    are kept for diagnostics and for the basis tests.
     """
 
     block_numbers: np.ndarray
@@ -82,6 +115,7 @@ class Cohorts:
     total_gas: np.ndarray
     anchor_price: np.ndarray
     anchor_tip: np.ndarray
+    reference: DemandReference
 
     def __len__(self) -> int:
         return int(self.block_numbers.size)
@@ -102,8 +136,8 @@ class Cohorts:
 def build_cohorts(tx_frame: pd.DataFrame, headers: pd.DataFrame) -> Cohorts:
     """Flatten simulatable transactions into cohorts, one per source block.
 
-    `headers` supplies the historical base fee per source block, which the demand
-    model anchors on and the bid rescale prices against.
+    `headers` supplies the historical base fee per source block, which the bid
+    rescale prices against and the demand reference is aggregated from.
     """
     missing = [c for c in COHORT_SOURCE_COLUMNS if c not in tx_frame.columns]
     if missing:
@@ -137,6 +171,47 @@ def build_cohorts(tx_frame: pd.DataFrame, headers: pd.DataFrame) -> Cohorts:
         total_gas=total_gas,
         anchor_price=anchor_price,
         anchor_tip=anchor_tip,
+        reference=_demand_reference(columns, total_gas, block_numbers.size),
+    )
+
+
+def _demand_reference(
+    columns: dict[str, np.ndarray], total_gas: np.ndarray, num_cohorts: int
+) -> DemandReference:
+    """The trace-level reference point of the demand curve. See `DemandReference`.
+
+    The price is gas-weighted over *transactions*, not averaged over cohorts: a
+    30M-gas block has to count for six times a 5M-gas one, because that is the
+    proportion in which the trace actually supplies gas. Averaging the per-cohort
+    anchors instead would weight every block equally and drift off the
+    `priority_fees_wei / sender_gas_used` basis the simulated side is measured on.
+
+    A trace with no sender-facing gas at all has no observable price, so the
+    reference price and tip fall back to 0 -- which `demand_multiplier` reads as
+    "no anchor", returning a flat `demand_level`.
+    """
+    # float64 throughout: tip x gas reaches ~1e19 for a large high-tip block,
+    # which overflows int64.
+    weight = columns["schedule_gas_used"].astype(np.float64)
+    tip = np.clip(
+        effective_tip(
+            columns["tx_type"],
+            columns["max_fee_per_gas"],
+            columns["max_priority_fee_per_gas"],
+            columns["anchor_base_fee"],
+        ),
+        0,
+        None,
+    ).astype(np.float64)
+    total_weight = float(weight.sum())
+    if total_weight <= 0:
+        return DemandReference(price=0.0, gas=0.0, tip=0.0)
+    mean_base_fee = float((columns["anchor_base_fee"].astype(np.float64) * weight).sum())
+    mean_tip = float((tip * weight).sum()) / total_weight
+    return DemandReference(
+        price=mean_base_fee / total_weight + mean_tip,
+        gas=float(total_gas.sum()) / max(num_cohorts, 1),
+        tip=mean_tip,
     )
 
 
@@ -204,42 +279,31 @@ def _segment_sum(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
     return np.add.reduceat(values, starts)
 
 
-def bootstrap_path(
-    cohorts: Cohorts, horizon: int, window_blocks: int, rng: np.random.Generator
+def composition_pools(
+    cohorts: Cohorts, horizon: int, pool_blocks: int, rng: np.random.Generator
 ) -> pd.DataFrame:
-    """Moving-block bootstrap: contiguous windows sampled with replacement.
+    """One composition pool per step: `pool_blocks` contiguous cohorts, redrawn each step.
 
-    Windows never wrap past the end of the source trace, so late-trace cohorts
-    are drawn less often than mid-trace ones -- the standard moving-block bias,
-    accepted here because wrapping would splice two unrelated fee regimes.
+    Starts are independent across steps and drawn with replacement, so pools
+    repeat and overlap freely. Nothing about a step's arrivals depends on the
+    step before it -- the pool supplies the transaction mix, and the demand model
+    supplies the quantity.
+
+    Pools never wrap past the end of the source trace, so cohorts in its last
+    `pool_blocks - 1` blocks appear in fewer pools than mid-trace ones. That edge
+    bias is accepted for the same reason as before: wrapping would build a pool
+    out of two unrelated fee regimes spliced end to start.
     """
-    if window_blocks > len(cohorts):
+    if pool_blocks > len(cohorts):
         raise ValueError(
-            f"window_blocks {window_blocks} exceeds the {len(cohorts)}-cohort source trace"
+            f"pool_blocks {pool_blocks} exceeds the {len(cohorts)}-cohort source trace"
         )
-    num_windows = -(-horizon // window_blocks)
-    starts = rng.integers(0, len(cohorts) - window_blocks + 1, size=num_windows)
-    within = np.arange(window_blocks, dtype=np.int64)
-
-    cohort_index = (starts[:, None] + within).ravel()[:horizon]
-    window_instance = np.repeat(np.arange(num_windows, dtype=np.int64), window_blocks)[:horizon]
-    position_in_window = np.tile(within, num_windows)[:horizon]
-    return _path_frame(cohorts, cohort_index, window_instance, position_in_window)
-
-
-def _path_frame(
-    cohorts: Cohorts,
-    cohort_index: np.ndarray,
-    window_instance: np.ndarray,
-    position_in_window: np.ndarray,
-) -> pd.DataFrame:
+    starts = rng.integers(0, len(cohorts) - pool_blocks + 1, size=horizon).astype(np.int64)
     return pd.DataFrame(
         {
-            "simulation_position": np.arange(cohort_index.size, dtype=np.int64),
-            "cohort_index": cohort_index.astype(np.int64),
-            "source_block_number": cohorts.block_numbers[cohort_index].astype(np.int64),
-            "window_instance": window_instance.astype(np.int64),
-            "position_in_window": position_in_window.astype(np.int64),
+            "simulation_position": np.arange(starts.size, dtype=np.int64),
+            "pool_start_index": starts,
+            "pool_start_block": cohorts.block_numbers[starts].astype(np.int64),
         },
         columns=list(PATH_COLUMNS),
     )
@@ -248,26 +312,26 @@ def _path_frame(
 # --- Demand model -----------------------------------------------------------------
 
 
-def demand_pool_bounds(cohorts: Cohorts, path: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Per step, the half-open flat-array slice induced demand is drawn from.
+def demand_pool_bounds(
+    cohorts: Cohorts, path: pd.DataFrame, pool_blocks: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per step, the half-open flat-array slice its arrivals are drawn from.
 
-    Drawing the increment from the arriving cohort alone would make it a near
-    copy of that one block. The pool is the bootstrap window the step belongs to
-    -- contiguous in cohort index, hence a contiguous slice of the flat arrays,
-    so sampling is an integer draw with no gather to build the pool.
+    A pool is contiguous in cohort index, hence a contiguous slice of the flat
+    arrays, so sampling is an integer draw with no gather to build the pool.
     """
-    grouped = path.groupby("window_instance")["cohort_index"]
-    first = path["window_instance"].map(grouped.min()).to_numpy(np.int64)
-    last = path["window_instance"].map(grouped.max()).to_numpy(np.int64)
-    return cohorts.offsets[first], cohorts.offsets[last + 1]
+    starts = path["pool_start_index"].to_numpy(np.int64)
+    return cohorts.offsets[starts], cohorts.offsets[starts + pool_blocks]
 
 
 def demand_multiplier(
     cfg: SimConfig, scenario: Scenario, price_signal: float, anchor_price: float
 ) -> tuple[float, bool]:
-    """Isoelastic demand at `price_signal`, relative to the cohort's anchor.
+    """Isoelastic demand at `price_signal`, relative to the reference price.
 
-    Returns the multiplier and whether the clamp bound.
+    Returns the multiplier and whether the clamp bound. `anchor_price` is the
+    trace-level `DemandReference.price`, fixed for the whole run, so the only
+    thing that moves the multiplier is the simulated price signal.
 
     The clamp is not cosmetic: `p ** -elasticity` is unbounded as the price
     falls, and the elasticity was estimated over base fees spanning roughly
@@ -288,38 +352,34 @@ def demand_multiplier(
 
 def sample_arrivals(
     cohorts: Cohorts,
-    cohort_index: int,
     pool: tuple[int, int],
-    multiplier: float,
+    gas_target: float,
     rng: np.random.Generator,
 ) -> dict[str, np.ndarray]:
-    """One step's arrivals: whole cohort copies plus a gas-sampled remainder.
+    """One step's arrivals: `gas_target` gas of transactions drawn from `pool`.
 
-    `floor(multiplier)` whole copies preserve the real block's transaction mix
-    exactly; only the fractional remainder is sampled, so composition noise is
-    confined to the margin and `multiplier < 1` is just the zero-copies case.
+    The whole arrival is sampled -- **uniformly over the pool's transactions,
+    with replacement**, until cumulative `total_gas` crosses the target -- so the
+    quantity is the demand model's alone and the pool contributes only the mix.
+    Uniform draws rather than gas-weighted ones: uniform reproduces the pool's
+    own gas distribution, where weighting by gas would over-represent large
+    transactions and quietly reshape the mix it is supposed to preserve.
 
-    The remainder is drawn **gas-weighted, with replacement** until the target
-    gas is crossed, and the crossing draw is kept -- the overshoot is at most one
-    transaction against a cohort-scale target, which is far below the resolution
-    of anything measured here, and correcting it would buy nothing.
+    The crossing draw is kept, so the overshoot is at most one transaction
+    against a block-scale target -- far below the resolution of anything measured
+    here, and correcting it would buy nothing.
 
     Arrivals are emitted sorted by flat position, which is `(source_block_number,
     tx_index)` order, with `replica_index` breaking ties among repeats of the
     same source transaction. That is the ordering `sim.engine`'s append-only
     mempool invariant depends on.
     """
-    start, stop = int(cohorts.offsets[cohort_index]), int(cohorts.offsets[cohort_index + 1])
-    whole = int(np.floor(multiplier))
-    remainder_gas = (multiplier - whole) * float(cohorts.total_gas[start:stop].sum())
-
-    drawn = []
-    if whole:
-        drawn.append(np.repeat(np.arange(start, stop, dtype=np.int64), whole))
-    if remainder_gas > 0:
-        drawn.append(_sample_to_gas_target(cohorts.total_gas, pool, remainder_gas, rng))
-
-    positions = np.sort(np.concatenate(drawn)) if drawn else np.empty(0, np.int64)
+    positions = (
+        _sample_to_gas_target(cohorts.total_gas, pool, gas_target, rng)
+        if gas_target > 0
+        else np.empty(0, np.int64)
+    )
+    positions = np.sort(positions)
     arrivals = {name: column[positions] for name, column in cohorts.columns.items()}
     _, counts = np.unique(positions, return_counts=True)
     arrivals["replica_index"] = _replica_index(counts)
@@ -417,10 +477,10 @@ def adapt_bids(arrivals: dict[str, np.ndarray], base_fee: int) -> dict[str, np.n
 
 
 def bootstrap_rng(cfg: SimConfig, run_index: int) -> np.random.Generator:
-    """Window-selection stream for one path; independent across runs and seeds."""
+    """Pool-selection stream for one path; independent across runs and seeds."""
     return np.random.default_rng([cfg.bootstrap_seed, run_index])
 
 
 def demand_rng(cfg: SimConfig, run_index: int) -> np.random.Generator:
-    """Demand-sampling stream for one path, independent of window selection."""
+    """Demand-sampling stream for one path, independent of the pool draw."""
     return np.random.default_rng([cfg.demand_seed, run_index])

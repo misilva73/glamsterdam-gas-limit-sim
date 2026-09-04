@@ -3,7 +3,7 @@
 `SimConfig` holds fixed run controls, `Scenario` holds one grid cell, and
 `SimulationGrid` holds the swept axes. Seeds for the independent random streams
 are derived from `random_seed` so that changing, say, the demand-replication draw
-cannot silently shift the bootstrap window selection.
+cannot silently shift the composition-pool draw.
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class SimConfig:
     # --- Demand model --------------------------------------------------------
     # The swept elasticity and demand level live in `Scenario`; these are fixed
     # controls shared by every cell in a run.
-    price_ema_blocks: int = 300
+    price_ema_blocks: int = 200
     demand_multiplier_bounds: tuple[float, float] = (0.05, 20.0)
     # Reprice historical fee caps from their own block's base fee to the
     # simulated one. Off means frozen caps, where the fee filter rather than the
@@ -149,7 +149,7 @@ class Scenario:
 
     aggregate_elasticity: float
     demand_level: float
-    bootstrap_window_blocks: int
+    composition_pool_blocks: int
 
     def __post_init__(self) -> None:
         if self.aggregate_elasticity < 0:
@@ -159,8 +159,8 @@ class Scenario:
             )
         if self.demand_level <= 0:
             raise ValueError("demand_level must be positive")
-        if self.bootstrap_window_blocks < 1:
-            raise ValueError("bootstrap_window_blocks must be >= 1")
+        if self.composition_pool_blocks < 1:
+            raise ValueError("composition_pool_blocks must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -178,11 +178,16 @@ class SimulationGrid:
     demand: blocks saturate through the gas-limit ramp and the base fee compounds
     until it hits `MAX_BASE_FEE`. It remains available as a single-scenario
     setting for a flat-multiplier run, where `demand_level <= 1` keeps it sane.
+
+    `composition_pool_blocks` is the third axis: how many contiguous source
+    blocks each step samples its transaction *mix* from. It is a robustness knob
+    rather than a demand assumption -- it sets nothing about quantity, only how
+    wide a slice of history the mix is drawn from. See `sim.workload`.
     """
 
     aggregate_elasticities: tuple[float, ...] = (0.1, 0.2, 0.3)
     demand_levels: tuple[float, ...] = (1.0, 1.5, 2.0)
-    bootstrap_window_blocks: tuple[int, ...] = (32,)
+    composition_pool_blocks: tuple[int, ...] = (16,)
 
 
 DEFAULT_CONFIG = SimConfig()

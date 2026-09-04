@@ -18,7 +18,7 @@ import pytest
 import run_simulation
 import schemas
 from config import DEFAULT_CONFIG, Scenario, SimulationGrid
-from sim.workload import bootstrap_path, bootstrap_rng, build_cohorts
+from sim.workload import bootstrap_rng, build_cohorts, composition_pools
 from tests.dummy import (
     DUMMY_ANALYSIS_CONFIG_HASH,
     dummy_block_headers,
@@ -28,7 +28,7 @@ from tests.dummy import (
 SCENARIO_KEYS = [
     "aggregate_elasticity",
     "demand_level",
-    "bootstrap_window_blocks",
+    "composition_pool_blocks",
 ]
 
 # --- synthetic per-step frames ----------------------------------------------
@@ -38,18 +38,18 @@ def synthetic_per_step(
     *,
     elasticities=(0.175,),
     levels=(1.0,),
-    windows=(32,),
+    pool_blocks=(16,),
     num_runs: int = 4,
     positions: int = 24,
     seed: int = 0,
 ) -> pd.DataFrame:
     """A per-step frame shaped exactly like the engine's output."""
     frame = pd.MultiIndex.from_product(
-        [list(elasticities), list(levels), list(windows), range(num_runs), range(positions)],
+        [list(elasticities), list(levels), list(pool_blocks), range(num_runs), range(positions)],
         names=[
             "aggregate_elasticity",
             "demand_level",
-            "bootstrap_window_blocks",
+            "composition_pool_blocks",
             "run_index",
             "simulation_position",
         ],
@@ -75,9 +75,9 @@ def synthetic_per_step(
     # consistent with what the engine would have recorded.
     multiplier = scale * (base_fee / anchor_price) ** -elasticity
 
-    frame["source_block_number"] = 21_000_000 + position
+    frame["pool_start_block"] = 21_000_000 + position
     frame["demand_price_signal"] = base_fee
-    frame["cohort_anchor_price"] = anchor_price
+    frame["demand_anchor_price"] = anchor_price
     frame["realized_demand_multiplier"] = multiplier
     frame["demand_multiplier_clamped"] = False
     frame["base_fee_per_gas"] = base_fee.astype(np.int64)
@@ -169,7 +169,7 @@ def test_build_config_applies_every_override(tmp_path):
             "0.2",
             "8",
             "--no-bid-adaptation",
-            "--window-blocks",
+            "--pool-blocks",
             "16",
             "64",
             "--output-dir",
@@ -190,7 +190,7 @@ def test_build_config_applies_every_override(tmp_path):
     assert cfg.adapt_bids is False
     assert not hasattr(cfg, "aggregate_elasticity")
     assert not hasattr(cfg, "demand_level")
-    assert not hasattr(cfg, "bootstrap_window_blocks")
+    assert not hasattr(cfg, "composition_pool_blocks")
 
 
 def test_build_config_leaves_unspecified_fields_at_their_defaults():
@@ -214,20 +214,20 @@ def test_build_grid_overrides_the_sweep():
             [
                 "--elasticities", "0", "0.3",
                 "--demand-levels", "1", "3",
-                "--window-blocks", "32",
+                "--pool-blocks", "32",
             ]
         )
     )
     assert grid.aggregate_elasticities == (0.0, 0.3)
     assert grid.demand_levels == (1.0, 3.0)
-    assert grid.bootstrap_window_blocks == (32,)
+    assert grid.composition_pool_blocks == (32,)
 
 
 def test_build_grid_defaults_to_the_plan_grid():
     grid = run_simulation.build_grid(parse([]))
     assert grid.aggregate_elasticities == (0.1, 0.2, 0.3)
     assert grid.demand_levels == (1.0, 1.5, 2.0)
-    assert grid.bootstrap_window_blocks == (32,)
+    assert grid.composition_pool_blocks == (16,)
 
 
 def test_the_analysis_config_hash_is_mandatory_on_the_command_line():
@@ -267,13 +267,13 @@ def test_headers_and_initial_fee_start_at_the_first_source_cohort(monkeypatch):
     assert run_simulation.resolve_starting_base_fee(cfg, fetched, simulatable) == 7_000_000_000
 
 
-def test_bootstrap_paths_are_reproducible_and_independent_across_runs():
+def test_pool_draws_are_reproducible_and_independent_across_runs():
     frame = dummy_cohorts(num_blocks=80)
     cohorts = build_cohorts(frame, dummy_block_headers(frame))
     cfg = run_simulation.build_config(parse(["--seed", "5"]))
-    path = lambda c, run: bootstrap_path(
+    path = lambda c, run: composition_pools(
         cohorts, 40, 32, bootstrap_rng(c, run)
-    )["cohort_index"].to_numpy()
+    )["pool_start_index"].to_numpy()
 
     assert (path(cfg, 0) == path(cfg, 0)).all()
     assert (path(cfg, 0) != path(cfg, 1)).any()
@@ -281,7 +281,7 @@ def test_bootstrap_paths_are_reproducible_and_independent_across_runs():
 
 
 def test_scenario_summary_reports_one_row_per_scenario():
-    axes = dict(elasticities=(0.0, 0.175), levels=(1.0, 3.0), windows=(16, 32))
+    axes = dict(elasticities=(0.0, 0.175), levels=(1.0, 3.0), pool_blocks=(16, 32))
     per_step = synthetic_per_step(**axes)
     summary = run_simulation.scenario_summary(per_step)
 
@@ -309,7 +309,7 @@ def end_to_end_args(tmp_path, *overrides: str):
             "0.175",
             "--demand-levels",
             "2",
-            "--window-blocks",
+            "--pool-blocks",
             "16",
             "--cache-dir",
             str(tmp_path / "cache"),
@@ -344,8 +344,8 @@ def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
     # run writes no figures and no CSV copy of the per-step data.
     written = {path.relative_to(result.run_dir).as_posix() for path in result.outputs}
     assert written == {
-        "per_step/e0.0_d2.0_w16.parquet",
-        "per_step/e0.175_d2.0_w16.parquet",
+        "per_step/e0.0_d2.0_p16.parquet",
+        "per_step/e0.175_d2.0_p16.parquet",
         "replay_outcome_summary.csv",
         "scenario_summary.csv",
         "manifest.json",
@@ -394,7 +394,7 @@ def test_every_run_writes_into_its_own_directory(tmp_path, offline_data):
 
 
 def test_cell_slug_round_trips_the_axis_values():
-    assert run_simulation.cell_slug(0.175, 1.0, 32) == "e0.175_d1.0_w32"
+    assert run_simulation.cell_slug(0.175, 1.0, 32) == "e0.175_d1.0_p32"
     # Neighbouring values must not collide into one part file.
     assert run_simulation.cell_slug(0.1750001, 1.0, 32) != run_simulation.cell_slug(
         0.175, 1.0, 32
@@ -411,7 +411,7 @@ def test_grid_cells_builds_validated_scenarios():
         SimulationGrid(
             aggregate_elasticities=(0.1,),
             demand_levels=(1.5,),
-            bootstrap_window_blocks=(32,),
+            composition_pool_blocks=(32,),
         )
     )
     assert cells == [Scenario(0.1, 1.5, 32)]
@@ -581,7 +581,7 @@ def test_stored_inputs_round_trip_the_manifest(tmp_path):
         output_dir=tmp_path / "out",
     )
     grid = SimulationGrid(
-        aggregate_elasticities=(0.1, 0.28), demand_levels=(1.5,), bootstrap_window_blocks=(16, 64)
+        aggregate_elasticities=(0.1, 0.28), demand_levels=(1.5,), composition_pool_blocks=(16, 64)
     )
     manifest = json.loads(
         json.dumps(
