@@ -243,7 +243,7 @@ Key defaults are:
 | --- | ---: |
 | initial / target gas limit | 60,000,000 / 200,000,000 |
 | ramp rate | current limit ÷ 1024 per block |
-| elasticities | 0.10, 0.175, 0.28 |
+| elasticities | 0.1, 0.2, 0.3 |
 | demand levels | 1, 1.5, 2 |
 | bootstrap window | 32 cohorts |
 | bootstrap runs per cell | 20 |
@@ -326,8 +326,8 @@ sets how quantity responds to price. With elasticity zero, the multiplier is
 always `demand_level`, although cohorts remain anchored because the engine has
 one unconditional input contract.
 
-The default elasticity grid follows the central estimate 0.175 and rounded
-event-based range 0.10–0.28 in the
+The default elasticity grid is round values bracketing the central estimate
+0.175 and event-based range 0.10–0.28 in the
 [EIP-8037 empirical analysis](https://ethresear.ch/t/empirical-analysis-of-price-elasticities-for-ethereum-state-and-burst-resources/24166).
 This model uses one aggregate elasticity, so it cannot model substitution between
 execution and state demand.

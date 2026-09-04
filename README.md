@@ -95,7 +95,7 @@ narrow them explicitly on a long trace.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
-| `--elasticities E [E ...]` | Demand-*shape* axis: aggregate price elasticity. `0` is a flat multiplier with no price response, and is no longer swept by default: with bid adaptation on it cannot shed demand above `--demand-levels 1`, so the base fee runs to the `MAX_BASE_FEE` ceiling and `base_fee_clamped_share` goes non-zero. | `0.10 0.175 0.28` |
+| `--elasticities E [E ...]` | Demand-*shape* axis: aggregate price elasticity. `0` is a flat multiplier with no price response, and is no longer swept by default: with bid adaptation on it cannot shed demand above `--demand-levels 1`, so the base fee runs to the `MAX_BASE_FEE` ceiling and `base_fee_clamped_share` goes non-zero. | `0.1 0.2 0.3` |
 | `--demand-levels A [A ...]` | Demand-*level* axis: latent-demand multiplier at the anchor price, standing in for never-included and secular-growth demand. | `1 1.5 2` |
 | `--window-blocks L [L ...]` | Bootstrap window length in cohorts. Pass multiple values for an explicit robustness sweep. | `32` |
 | `--output-dir PATH` | Parent of the timestamped directory this run writes. | `output/` |

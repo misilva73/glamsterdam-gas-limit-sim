@@ -169,8 +169,8 @@ class SimulationGrid:
 
     The demand axes are the two halves of the model: `aggregate_elasticities`
     sets the *shape* of the response to price, `demand_levels` its *level*. The
-    elasticity defaults span the report's event-based range (0.10-0.28) around
-    its central 0.175.
+    elasticity defaults are round values bracketing the report's event-based
+    range (0.10-0.28) around its central 0.175.
 
     Zero is deliberately *not* swept. A flat multiplier cannot respond to price,
     and bid adaptation preserves eligibility by design (METHODOLOGY 6.4), so at
@@ -180,7 +180,7 @@ class SimulationGrid:
     setting for a flat-multiplier run, where `demand_level <= 1` keeps it sane.
     """
 
-    aggregate_elasticities: tuple[float, ...] = (0.10, 0.175, 0.28)
+    aggregate_elasticities: tuple[float, ...] = (0.1, 0.2, 0.3)
     demand_levels: tuple[float, ...] = (1.0, 1.5, 2.0)
     bootstrap_window_blocks: tuple[int, ...] = (32,)
 

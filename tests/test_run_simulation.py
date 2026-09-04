@@ -225,7 +225,7 @@ def test_build_grid_overrides_the_sweep():
 
 def test_build_grid_defaults_to_the_plan_grid():
     grid = run_simulation.build_grid(parse([]))
-    assert grid.aggregate_elasticities == (0.10, 0.175, 0.28)
+    assert grid.aggregate_elasticities == (0.1, 0.2, 0.3)
     assert grid.demand_levels == (1.0, 1.5, 2.0)
     assert grid.bootstrap_window_blocks == (32,)
 

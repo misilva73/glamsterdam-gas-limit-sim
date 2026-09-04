@@ -173,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         metavar="E",
         help="demand-shape axis: aggregate price elasticity of demand "
-        "(default: 0.10 0.175 0.28). 0 is a flat multiplier with no price response "
+        "(default: 0.1 0.2 0.3). 0 is a flat multiplier with no price response "
         "and is not swept: it cannot shed demand, so above demand level 1 the base "
         "fee runs to the MAX_BASE_FEE ceiling",
     )
