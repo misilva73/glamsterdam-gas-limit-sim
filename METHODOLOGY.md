@@ -524,15 +524,19 @@ flight is held in memory, so a full sweep runs in a single process, and an
 interrupted run keeps every cell that completed. Data is always written before
 the summary row describing it, so a summary row means a complete cell.
 
-`--resume STAMP` continues an interrupted run in its own directory. Cells are
-simulated in a fixed order, so the checkpointed cells are a prefix of the grid:
-the resumed run counts them, truncates `scenario_summary.csv` to match, and
-simulates the rest. A cell caught mid-checkpoint is simulated again over its own
-part files. Resuming is refused unless the stored config, grid, seed, and resolved
-trace (horizon, starting base fee, derived seeds) all match, since a directory
-mixing two simulations could not be read coherently. A resumed sweep reproduces
-the uninterrupted one exactly: every path's randomness comes from the master seed
-and its run index, not from the order cells were executed in.
+`--resume STAMP` continues an interrupted run in its own directory, and takes its
+config and grid from that run's `manifest.json` rather than from the command line
+— the stamp and, if the run is not under the default `output_dir`, where to look
+are the whole invocation. Flags given anyway layer on top of the stored ones.
+
+Cells are simulated in a fixed order, so the checkpointed cells are a prefix of
+the grid: the resumed run counts them, truncates `scenario_summary.csv` to match,
+and simulates the rest. A cell caught mid-checkpoint is simulated again over its
+own part files. Resuming is refused unless the stored config, grid, seed, per-step
+schema, and resolved trace (horizon, starting base fee, derived seeds) all match,
+since a directory mixing two simulations could not be read coherently. A resumed
+sweep reproduces the uninterrupted one exactly: every path's randomness comes from
+the master seed and its run index, not from the order cells were executed in.
 
 ### 8.1 Per-step data
 

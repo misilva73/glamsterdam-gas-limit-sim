@@ -63,7 +63,7 @@ given run actually resolved to is recorded in its `manifest.json`.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
-| `--analysis-config-hash HASH` | Which reth replay config to read. **Required**, so a run can never silently mix datasets. | — |
+| `--analysis-config-hash HASH` | Which reth replay config to read. **Required** unless `--resume` supplies it, so a run can never silently mix datasets. | — |
 | `--schedule-name NAME` | Repricing schedule whose gas is simulated. | `amsterdam` |
 | `--schedule-config-hash HASH` | Pin one revision of `--schedule-name`. | whatever the table holds |
 | `--chain-id N` | Chain of the replay rows. | `1` |
@@ -99,7 +99,7 @@ narrow them explicitly on a long trace.
 | `--demand-levels A [A ...]` | Demand-*level* axis: latent-demand multiplier at the anchor price, standing in for never-included and secular-growth demand. | `1 1.5 2` |
 | `--window-blocks L [L ...]` | Bootstrap window length in cohorts. Pass multiple values for an explicit robustness sweep. | `32` |
 | `--output-dir PATH` | Parent of the timestamped directory this run writes. | `output/` |
-| `--resume STAMP` | Continue an interrupted run: the name of its directory under `--output-dir`. Cells already checkpointed there are skipped and the rest are written into the same directory. Refused unless the config, grid, seed, and resolved trace all match the run being resumed. | off |
+| `--resume STAMP` | Continue an interrupted run: the name of its directory under `--output-dir`. Cells already checkpointed there are skipped and the rest are written into the same directory. The config and grid are read from that run's manifest, so no other flag is needed; any that is given layers on top and must still match what the run recorded. | off |
 
 ## Output
 
@@ -142,19 +142,26 @@ output/20260904T083556Z/
 ### Resuming an interrupted sweep
 
 A long sweep that dies keeps every cell it checkpointed. Restart it with the
-directory name and it picks up where it stopped:
+directory name and nothing else — the config and grid come from that run's
+`manifest.json`, so there is no list of flags to get right a second time:
 
 ```bash
-.venv/bin/python run_simulation.py <same flags as before> \
-    --resume 20260904T083556Z
+.venv/bin/python run_simulation.py --resume 20260904T083556Z
 ```
+
+Add `--output-dir` if the run is not under the default `output/`; that is how the
+directory is found, and it is the one thing the manifest cannot be trusted for
+(the tree may have moved). Any other flag still applies, layered on top of the
+stored config — useful for `--cache-dir` on a different machine — but a flag that
+would change the numbers is refused rather than honoured.
 
 Cells are simulated in a fixed order, so what is on disk is a prefix of the grid;
 `--resume` counts the complete cells and simulates the rest into the same
 directory. A cell caught between its parquet parts and its summary row is
 simulated again rather than trusted. Resuming is refused — before the load, so it
 fails in milliseconds — if the config, grid, or seed differs from the run being
-resumed, or if the trace itself moved (the replay table grows, so the same block
+resumed, if that run's manifest records a config field this version no longer
+has, or if the trace itself moved (the replay table grows, so the same block
 range can resolve to a longer horizon than the finished cells were run against).
 Either way the answer is a fresh run, not a mixed directory.
 

@@ -164,9 +164,22 @@ Model in `METHODOLOGY.md` §6.
   bounded by the summary row count, and truncates the summary to that prefix.
   Reordering those writes silently breaks resume.
 - **The manifest is written twice**, before the first cell and at the end, and
-  `completed` tells them apart. `--resume` compares the stored `config`, `grid`,
+  `completed` tells them apart. It is also the *input* to a resumed run:
+  `resolve_inputs` rebuilds `SimConfig` and `SimulationGrid` from it
+  (`stored_inputs`) and layers whatever flags were given on top, so `--resume
+  STAMP` alone is a complete command line — which is why
+  `--analysis-config-hash` is enforced in `resolve_inputs` rather than by
+  `required=True`. `open_resumed_run` then compares the stored `config`, `grid`,
   per-step schema, and `resolved` against the current ones and refuses on any
-  difference except the path fields in `RESUME_EXEMPT_CONFIG_FIELDS`.
+  difference except the path fields in `RESUME_EXEMPT_CONFIG_FIELDS`. Via the CLI
+  that check has nothing left to catch; it is the guard for callers passing their
+  own config to `run_simulation`.
+- **Reading a config back is type-lossy and deliberately strict.** JSON has no
+  `Path` and no tuple, so `stored_inputs` restores `PATH_CONFIG_FIELDS` as paths
+  and every list as a tuple. A manifest naming a field `SimConfig` no longer has
+  is refused outright: the retired knob had a value in the finished cells, and
+  substituting today's default would make the two halves of the sweep
+  incomparable.
 - **Both persistent-state updates are parent-derived.** Neither the base fee nor
   the ramp is applied at position 0, so the first recorded block reports the
   configured initial state verbatim and the ramp first applies at position 1.

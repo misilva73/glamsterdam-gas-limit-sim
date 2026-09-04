@@ -231,9 +231,15 @@ def test_build_grid_defaults_to_the_plan_grid():
 
 
 def test_the_analysis_config_hash_is_mandatory_on_the_command_line():
-    """A run can never silently average two replay configurations."""
+    """A run can never silently average two replay configurations.
+
+    Enforced past the parser now, since `--resume` supplies the hash itself.
+    """
+    parser = run_simulation.build_parser()
     with pytest.raises(SystemExit):
-        run_simulation.build_parser().parse_args(["--block-range", "1", "2"])
+        run_simulation.resolve_inputs(
+            parser, parser.parse_args(["--block-range", "1", "2"])
+        )
 
 
 def test_headers_and_initial_fee_start_at_the_first_source_cohort(monkeypatch):
@@ -541,6 +547,96 @@ def test_resume_refuses_a_different_per_step_schema(tmp_path, offline_data, monk
 
     with pytest.raises(ValueError, match="per-step schema"):
         run_end_to_end(tmp_path, *FOUR_CELLS, resume=run_dir.name)
+
+
+def test_resume_needs_no_flags_but_the_stamp(tmp_path, offline_data, monkeypatch):
+    """The manifest already knows the config; the CLI should not ask for it again."""
+    reference = run_end_to_end(tmp_path / "whole", *FOUR_CELLS)
+    partial = tmp_path / "killed"
+    run_dir = interrupted_run(partial, monkeypatch, after=2)
+
+    # No block range, no hash, no grid: only where to look and which run.
+    assert (
+        run_simulation.main(
+            ["--output-dir", str(partial / "out"), "--resume", run_dir.name]
+        )
+        == 0
+    )
+
+    assert json.loads((run_dir / "manifest.json").read_text())["completed"] is True
+    pd.testing.assert_frame_equal(
+        pd.read_csv(run_dir / "scenario_summary.csv"),
+        pd.read_csv(reference.run_dir / "scenario_summary.csv"),
+    )
+
+
+def test_stored_inputs_round_trip_the_manifest(tmp_path):
+    """What `run_manifest` writes is what `--resume` must read back."""
+    cfg = DEFAULT_CONFIG.with_(
+        analysis_config_hash="abc123",
+        source_block_range=(21_000_000, 21_000_999),
+        demand_multiplier_bounds=(0.2, 8.0),
+        adapt_bids=False,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "out",
+    )
+    grid = SimulationGrid(
+        aggregate_elasticities=(0.1, 0.28), demand_levels=(1.5,), bootstrap_window_blocks=(16, 64)
+    )
+    manifest = json.loads(
+        json.dumps(
+            run_simulation.run_manifest(
+                cfg, grid, {}, {}, [], tmp_path / "out" / "stamp", completed=False
+            ),
+            default=str,
+        )
+    )
+
+    restored_cfg, restored_grid = run_simulation.stored_inputs(manifest, cfg.output_dir)
+    assert restored_cfg == cfg
+    assert restored_grid == grid
+
+
+def test_stored_inputs_refuses_a_manifest_from_another_config_schema(tmp_path):
+    manifest = {"config": {"random_seed": 7, "retired_knob": 3}, "grid": {}}
+
+    with pytest.raises(ValueError, match="retired_knob"):
+        run_simulation.stored_inputs(manifest, tmp_path)
+
+
+def test_resume_layers_flags_onto_the_stored_config(
+    tmp_path, offline_data, monkeypatch
+):
+    """Flags given alongside --resume still apply: a path may move, numbers may not."""
+    run_dir = interrupted_run(tmp_path, monkeypatch, after=2)
+    parser = run_simulation.build_parser()
+    cfg, grid = run_simulation.resolve_inputs(
+        parser,
+        parser.parse_args(
+            [
+                "--output-dir",
+                str(tmp_path / "out"),
+                "--resume",
+                run_dir.name,
+                "--cache-dir",
+                str(tmp_path / "elsewhere"),
+            ]
+        ),
+    )
+
+    stored = json.loads((run_dir / "manifest.json").read_text())["config"]
+    assert cfg.cache_dir == tmp_path / "elsewhere"  # the flag wins
+    assert cfg.output_dir == tmp_path / "out"  # where the run was actually found
+    assert cfg.analysis_config_hash == stored["analysis_config_hash"]  # the rest is stored
+    assert cfg.source_block_range == tuple(stored["source_block_range"])
+    assert cfg.random_seed == stored["random_seed"]
+    assert grid.demand_levels == (1.0, 2.0)
+
+    # A flag that would change the numbers is still refused, end to end.
+    with pytest.raises(ValueError, match="different random_seed"):
+        run_simulation.main(
+            ["--output-dir", str(tmp_path / "out"), "--resume", run_dir.name, "--seed", "1"]
+        )
 
 
 def test_resume_refuses_a_completed_run(tmp_path, offline_data):

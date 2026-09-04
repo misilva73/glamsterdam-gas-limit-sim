@@ -30,7 +30,7 @@ import json
 import platform
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import NamedTuple
@@ -57,8 +57,15 @@ MANIFEST_FILE = "manifest.json"
 RUN_DIR_FORMAT = "%Y%m%dT%H%M%SZ"
 """UTC stamp naming a run's own output directory, so runs sort chronologically."""
 
-RESUME_EXEMPT_CONFIG_FIELDS = frozenset({"output_dir", "cache_dir", "secrets_path"})
-"""Config fields `--resume` tolerates differing: where files live, not what is simulated."""
+PATH_CONFIG_FIELDS = frozenset({"output_dir", "cache_dir", "secrets_path"})
+"""`SimConfig` fields the manifest stores as strings and must read back as `Path`."""
+
+RESUME_EXEMPT_CONFIG_FIELDS = PATH_CONFIG_FIELDS
+"""Config fields `--resume` tolerates differing.
+
+Exactly the path fields: where the cache, the secrets, and the output tree live
+says nothing about the numbers, and a resume may happen on another machine.
+"""
 
 SATURATION_THRESHOLD = 0.99
 """Utilization at or above which a block counts as saturated in a dimension."""
@@ -91,9 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     source = parser.add_argument_group("source data")
     source.add_argument(
         "--analysis-config-hash",
-        required=True,
-        help="reth replay config to read; mandatory, so a run can never silently "
-        "mix datasets",
+        help="reth replay config to read; mandatory unless --resume supplies it, so "
+        "a run can never silently mix datasets",
     )
     source.add_argument(
         "--schedule-name",
@@ -198,8 +204,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="STAMP",
         help="continue an interrupted run: the name of its directory under "
         "--output-dir (e.g. 20260904T083556Z). Cells already checkpointed there "
-        "are skipped; the config, grid, seed, and resolved trace must match the "
-        "run being resumed or nothing is written",
+        "are skipped. The config and grid come from that run's manifest, so no "
+        "other flag is needed; any flag given anyway must agree with what the run "
+        "recorded, or nothing is written",
     )
     return parser
 
@@ -541,6 +548,50 @@ def run_dir_files(run_dir: Path) -> list[Path]:
 # --- Resume -----------------------------------------------------------------
 
 
+def read_prior_manifest(output_dir: Path, resume: str) -> tuple[Path, dict]:
+    """Find the `--resume STAMP` directory under `output_dir` and read its manifest."""
+    run_dir = Path(output_dir) / resume
+    manifest_path = run_dir / MANIFEST_FILE
+    if not run_dir.is_dir():
+        available = sorted(p.name for p in Path(output_dir).glob("*") if p.is_dir())
+        raise ValueError(
+            f"nothing to resume: {run_dir} does not exist. "
+            f"Available runs: {available or 'none'}"
+        )
+    if not manifest_path.exists():
+        raise ValueError(
+            f"cannot resume {run_dir}: no {MANIFEST_FILE}, so that run died during "
+            "the load and simulated nothing. Start a fresh run instead"
+        )
+    return run_dir, json.loads(manifest_path.read_text())
+
+
+def stored_inputs(manifest: dict, output_dir: Path) -> tuple[SimConfig, SimulationGrid]:
+    """The config and grid a run recorded, so resuming need not repeat its flags.
+
+    `output_dir` comes from where the run was actually found rather than from the
+    manifest, since that is the one field the tree itself can contradict -- the
+    output may have been moved, or mounted somewhere else on this machine.
+
+    A manifest holding fields `SimConfig` no longer has is refused rather than
+    quietly dropped: the missing knob had a value in the finished cells, and
+    silently substituting today's default would make the two halves incomparable.
+    """
+    stored = manifest.get("config", {})
+    unknown = set(stored) - {field.name for field in fields(SimConfig)}
+    if unknown:
+        raise ValueError(
+            f"cannot rebuild the config from {MANIFEST_FILE}: it records "
+            f"{', '.join(sorted(unknown))}, which this version of SimConfig does "
+            "not have. That run predates a config change; start a fresh run"
+        )
+    cfg = SimConfig(**{name: _config_value(name, v) for name, v in stored.items()})
+    grid = SimulationGrid(
+        **{name: _tupled(v) for name, v in manifest.get("grid", {}).items()}
+    )
+    return cfg.with_(output_dir=Path(output_dir)), grid
+
+
 class ResumedRun(NamedTuple):
     run_dir: Path
     cells_done: int
@@ -560,21 +611,11 @@ def open_resumed_run(
 
     Refuses anything but a directory holding a matching, unfinished run: resuming
     into a different config, grid, or seed would leave one output directory
-    describing two simulations, which no reader could untangle.
+    describing two simulations, which no reader could untangle. The CLI rebuilds
+    both from the same manifest, so this normally has nothing to reject -- it is
+    the guard for callers that pass their own config in.
     """
-    run_dir = Path(cfg.output_dir) / resume
-    manifest_path = run_dir / MANIFEST_FILE
-    if not run_dir.is_dir():
-        raise ValueError(
-            f"nothing to resume: {run_dir} does not exist. Available runs: "
-            f"{sorted(p.name for p in Path(cfg.output_dir).glob('*') if p.is_dir()) or 'none'}"
-        )
-    if not manifest_path.exists():
-        raise ValueError(
-            f"cannot resume {run_dir}: no {MANIFEST_FILE}, so that run died during "
-            "the load and simulated nothing. Start a fresh run instead"
-        )
-    prior = json.loads(manifest_path.read_text())
+    run_dir, prior = read_prior_manifest(cfg.output_dir, resume)
     if prior.get("completed"):
         raise ValueError(f"cannot resume {run_dir}: that run completed")
     mismatched = resume_mismatches(prior, cfg, grid)
@@ -721,10 +762,34 @@ def library_versions() -> dict[str, str]:
     }
 
 
+def resolve_inputs(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> tuple[SimConfig, SimulationGrid]:
+    """The config and grid to run, from the command line or from a resumed run.
+
+    Resuming layers whatever flags were given onto the stored ones rather than
+    ignoring them, so `--cache-dir` can move and a typo still gets caught: the
+    result goes through `open_resumed_run`, which refuses any difference that
+    would change the numbers.
+    """
+    if args.resume:
+        run_dir, prior = read_prior_manifest(
+            args.output_dir or DEFAULT_CONFIG.output_dir, args.resume
+        )
+        base_cfg, base_grid = stored_inputs(prior, run_dir.parent)
+        return build_config(args, base_cfg), build_grid(args, base_grid)
+    if not args.analysis_config_hash:
+        parser.error(
+            "--analysis-config-hash is required, so a run can never silently mix "
+            "datasets; --resume takes it from the run it continues"
+        )
+    return build_config(args), build_grid(args)
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    cfg = build_config(args)
-    grid = build_grid(args)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    cfg, grid = resolve_inputs(parser, args)
     result = run_simulation(cfg, grid, resume=args.resume)
 
     print(_banner("REPLAY OUTCOME MIX (every row is simulated; nothing is excluded)"))
@@ -746,6 +811,16 @@ def main(argv: list[str] | None = None) -> int:
 def _jsonable(value: dict) -> dict:
     """Round-trip through JSON so tuples compare equal to the lists on disk."""
     return json.loads(json.dumps(value, default=str))
+
+
+def _tupled(value):
+    """JSON has no tuples; the dataclasses want the ones they wrote back."""
+    return tuple(value) if isinstance(value, list) else value
+
+
+def _config_value(name: str, value):
+    """One manifest field back in the type `SimConfig` declares for it."""
+    return Path(value) if name in PATH_CONFIG_FIELDS else _tupled(value)
 
 
 @contextmanager
