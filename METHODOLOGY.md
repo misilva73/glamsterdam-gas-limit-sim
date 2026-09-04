@@ -166,6 +166,14 @@ Both loaders cache Parquet data plus a JSON provenance sidecar in `cache_dir`.
 Cache identity includes the source table or network, pinned dataset fields, and
 requested block range.
 
+The replay extract is written **one block-chunk at a time**, so its cache entry is
+a directory of `part-NNNNN.parquet` parts rather than a single file; the parts
+partition the trace in ascending block order and are read back as one frame. This
+is a memory measure, not a semantic one — the trace is far too large to hold in
+raw and normalized form at once — and the reassembled frame is identical to
+preparing the whole extract in one piece. A fetch that dies partway leaves no
+entry at all rather than a short one.
+
 The replay sidecar records the requested and observed range, row and block counts,
 hash and timestamp coverage, producer versions, replay semantics, and fetch time.
 The header sidecar records its requested range and missing-block count.

@@ -29,7 +29,9 @@ conftest.py                   makes the repo root importable for bare `pytest`
 
 data/load_tx_gas_results.py   ClickHouse loading, filtering, gas derivation
 data/fetch_blocks.py          Xatu block headers, block-range resolution, starting base fee
-data/cache.py                 Parquet + JSON-sidecar cache used by both loaders
+data/cache.py                 Parquet + JSON-sidecar cache used by both loaders;
+                              an entry is one file, or a directory of parts when
+                              streamed
 
 sim/workload.py               cohorts + demand anchors, moving-block-bootstrap paths,
                               the demand model (multiplier,
@@ -56,11 +58,12 @@ disabled.
 ## Live dataset status
 
 `gas_analysis.gas_analysis_tx_gas_result` exists, is being populated, and the full
-pipeline has been run end to end against it. As measured 2026-09-01: ~12.9M rows,
-41,380 blocks spanning `25278577`–`25319985`, ~5.75 days, one
-`(analysis_config_hash, schedule_config_hash, schedule_name)`. It grows fast —
-**re-measure the range before planning a simulation** rather than trusting those
-numbers.
+pipeline has been run end to end against it. As measured 2026-09-04: ~44.0M rows,
+151,144 blocks spanning `25168786`–`25319985`, ~21 days, one
+`(analysis_config_hash, schedule_config_hash, schedule_name)`. It grows fast, and
+it is **backfilled at the head as well as the tail** — the 2026-09-01 measurement
+had it starting at `25278577`, 110k blocks later — so **re-measure the range before
+planning a simulation** rather than trusting those numbers.
 
 Operational facts, confirmed live:
 
@@ -76,11 +79,12 @@ Operational facts, confirmed live:
   and `BLOCK_CHUNK` is about query size, not index use. Ad-hoc inventory queries
   must pin at least `chain_id`: a bare `GROUP BY` raises `INDEX_NOT_USED` (code
   277) rather than returning slowly.
-- **Coverage has 25 gaps totalling 29 blocks.** All but one are single
-  zero-transaction mainnet blocks, which a per-transaction table cannot represent;
-  the one cluster is `25278577`–`25278594`, a ragged replay start. **Start a range
-  at 25278600 or later.** Positional cohorts tolerate skipped block numbers, so the
-  single-block gaps need no handling.
+- **Coverage gaps are all single blocks** as of the 2026-09-04 backfill: every gap
+  in `25168786`–`25319985` is one zero-transaction mainnet block, which a
+  per-transaction table cannot represent. Positional cohorts tolerate skipped block
+  numbers, so they need no handling. The ragged `25278577`–`25278594` start that
+  once forced a `25278600` floor has been filled in; the current first block is
+  clean and needs no offset.
 - Column names and types are confirmed; the loader normalization rules are
   summarized in `METHODOLOGY.md` §3.1.
 
@@ -89,7 +93,7 @@ ClickHouse is the only input, so **every real run needs credentials** — gitign
 a provenance sidecar (§3.4).
 
 The suite stays offline by injecting `tests/dummy.py` frames at the two functions
-that talk to a cluster (`fetch_tx_gas_results`, `fetch_block_headers_uncached`) —
+that talk to a cluster (`fetch_tx_gas_result_chunks`, `fetch_block_headers_uncached`) —
 the `offline_data` fixture. Never add an offline branch back into `data/`: an
 autouse fixture blocks `clickhouse_connect.get_client`, so a test that needs data
 and forgets `offline_data` fails with a message telling it what to request.
@@ -268,6 +272,18 @@ process — sharding it per cell across invocations is no longer necessary, and 
 shard would pay the ~16 GB source-frame floor again. Peak is briefly two copies of
 one cell, from the concat that assembles its part file.
 
+**Nor does it scale with the fetch.** The loader used to hold every raw block-chunk
+and then concatenate them, which cost roughly `10 GB + 1.24 GB per million rows`
+and was OOM-killed at 64.7 GB fetching the 44M-row range on the 62 GB rig. Chunks
+are now normalised straight into their own Parquet part under the cache entry
+(`load_tx_gas_results._stream_to_cache`), so fetch peak is set by `BLOCK_CHUNK`
+rather than by range length, and the combined frame is materialised exactly once
+when the parts are read back. A cache entry is consequently a **directory of
+`part-NNNNN.parquet`**, not a single file; `cache.read_cached` accepts either, and
+parts are read in lexical order because that is block order — `load_tx_gas_results`
+re-checks that the reassembled frame is block-sorted rather than trusting it, since
+cohorts are cut positionally and a shuffled trace would fail nowhere else.
+
 The mempool is tombstoned parallel numpy arrays with amortised compaction
 (`COMPACTION_DEAD_SHARE`), and the tip sort is tranched (`TIP_TRANCHE_SIZE`),
 cutting only at tip *values*, never mid-tie. Nothing is capped or approximated:
@@ -295,13 +311,11 @@ implementations, and compaction cadence is asserted not to change output.
 5. **The dataset is still being written**, so a cached extract and a fresh query can
    disagree. Only one `analysis_config_hash` and one schedule exist so far, so the
    hash-mixing guard has never fired on real data.
-6. **Chunked reads are unproven at scale.** `BLOCK_CHUNK = 5_000` is validated for
-   Xatu but the replay table has never been read in a range needing more than one
-   chunk, so whether `FINAL` dedup can straddle a chunk boundary is untested — it
-   should not, since chunks are disjoint block ranges and the primary key leads with
-   `(chain_id, analysis_config_hash, schedule_name, block_hash, ...)`. The largest
-   range actually simulated is 4,000 blocks, so gap #2's memory ceiling is likewise
-   untested at week scale.
+6. **`FINAL` dedup across chunk boundaries is still untested.** Multi-chunk reads
+   are now routine, but whether `FINAL` can straddle a `BLOCK_CHUNK` boundary has
+   never been checked directly — it should not, since chunks are disjoint block
+   ranges and the primary key leads with
+   `(chain_id, analysis_config_hash, schedule_name, block_hash, ...)`.
 
 ## Conventions
 

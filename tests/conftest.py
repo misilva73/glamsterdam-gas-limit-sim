@@ -2,11 +2,15 @@
 
 The simulation reads ClickHouse and nothing else, so there is no offline mode to
 switch on. Instead the two functions that touch the network --
-`load_tx_gas_results.fetch_tx_gas_results` and
+`load_tx_gas_results.fetch_tx_gas_result_chunks` and
 `fetch_blocks.fetch_block_headers_uncached` -- are replaced with `tests.dummy`
 generators. Both are called through their module globals by the cached wrappers
 above them, so patching the module attribute leaves caching, dtype normalisation,
 the dataset guard and provenance on the real code path.
+
+The replay stand-in yields the trace in `block_chunks` pieces exactly as the real
+fetch does, so the streamed cache write -- one Parquet part per chunk, provenance
+accumulated across them -- is what the suite actually exercises.
 """
 
 from __future__ import annotations
@@ -29,6 +33,9 @@ NUM_BLOCKS = 60
 LAST_BLOCK = FIRST_BLOCK + NUM_BLOCKS - 1
 
 
+OFFLINE_BLOCK_CHUNK = 25
+
+
 def offline_tx_gas_results(cfg: SimConfig) -> pd.DataFrame:
     """Stand-in for `fetch_tx_gas_results`: source-shaped rows for the pinned range."""
     first_block, last_block = loader.require_block_range(cfg)
@@ -37,6 +44,20 @@ def offline_tx_gas_results(cfg: SimConfig) -> pd.DataFrame:
         num_blocks=last_block - first_block + 1,
         schedule_name=cfg.schedule_name,
     )
+
+
+def offline_tx_gas_result_chunks(cfg: SimConfig):
+    """Stand-in for `fetch_tx_gas_result_chunks`, cut the way the real fetch cuts.
+
+    The chunk is deliberately far smaller than `BLOCK_CHUNK` so the 60-block
+    synthetic range still arrives as several chunks. A single-chunk stand-in would
+    leave part ordering and provenance merging -- the parts of the streamed write
+    that can actually be wrong -- uncovered.
+    """
+    rows = offline_tx_gas_results(cfg)
+    first_block, last_block = loader.require_block_range(cfg)
+    for lo, hi in loader.block_chunks(first_block, last_block, chunk=OFFLINE_BLOCK_CHUNK):
+        yield rows[rows["block_number"].between(lo, hi)].reset_index(drop=True)
 
 
 def offline_block_headers(
@@ -87,7 +108,7 @@ def no_network(monkeypatch):
 @pytest.fixture
 def offline_data(monkeypatch):
     """Serve both datasets from `tests.dummy` instead of ClickHouse."""
-    monkeypatch.setattr(loader, "fetch_tx_gas_results", offline_tx_gas_results)
+    monkeypatch.setattr(loader, "fetch_tx_gas_result_chunks", offline_tx_gas_result_chunks)
     monkeypatch.setattr(
         fetch_blocks, "fetch_block_headers_uncached", offline_block_headers
     )

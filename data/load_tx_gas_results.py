@@ -85,13 +85,59 @@ def load_tx_gas_results(cfg: SimConfig) -> pd.DataFrame:
     """Fetch (or reload from cache) the pinned replay rows, dtype-clean and derived."""
     path = tx_gas_results_cache_path(cfg)
     cached = cache.read_cached(path)
-    if cached is not None:
-        return assert_single_dataset(cached, cfg)
+    if cached is None:
+        _stream_to_cache(cfg, path)
+        cached = cache.read_cached(path)
+    return assert_single_dataset(_assert_block_ordered(cached), cfg)
 
-    raw = fetch_tx_gas_results(cfg)
-    frame = prepare_tx_gas_results(raw, cfg)
-    cache.write_cached(path, frame, tx_gas_results_provenance(raw, frame, cfg))
+
+def _assert_block_ordered(frame: pd.DataFrame) -> pd.DataFrame:
+    """A streamed entry is only sorted if its parts are read back in write order.
+
+    Cohorts are cut from this frame positionally, so parts recombined out of order
+    would not fail anywhere -- it would quietly simulate a shuffled trace.
+    """
+    if not frame["block_number"].is_monotonic_increasing:
+        raise ValueError(
+            "cached replay rows are not in block order; the cache entry is "
+            "corrupt -- delete it and re-fetch"
+        )
     return frame
+
+
+def _stream_to_cache(cfg: SimConfig, path: Path) -> None:
+    """Fetch, normalise and cache the trace one block-chunk at a time.
+
+    The trace is far bigger than the chunks it arrives in, and materialising every
+    raw chunk before concatenating is what makes a full-range fetch impossible: the
+    21-day range (44M rows) peaked at 65 GB on a 62 GB machine and was OOM-killed,
+    because the raw chunks, their concatenation and the normalised copy were all
+    live at once. Normalising each chunk straight into its own Parquet part holds
+    only one chunk at a time, so peak memory is set by `BLOCK_CHUNK` rather than by
+    the length of the range.
+
+    Provenance is accumulated per chunk for the same reason -- it describes the raw
+    rows, which are gone by the time the next chunk arrives.
+    """
+    first_block, last_block = require_block_range(cfg)
+    staging = cache.begin_parts(path)
+    try:
+        stats = []
+        for raw in fetch_tx_gas_result_chunks(cfg):
+            # A chunk can be empty (a quiet block range, or a gap in coverage); it
+            # carries no provenance and would only add an empty part.
+            if raw.empty:
+                continue
+            prepared = prepare_tx_gas_results(raw, cfg)
+            cache.write_part(staging, len(stats), prepared)
+            stats.append(_provenance_stats(raw, prepared, cfg))
+            del raw, prepared
+        if not stats:
+            raise ValueError(_empty_result_report(cfg, first_block, last_block))
+        cache.commit_parts(staging, path, _merge_provenance(stats, cfg))
+    except BaseException:
+        cache.discard_parts(staging)
+        raise
 
 
 def tx_gas_results_cache_path(cfg: SimConfig) -> Path:
@@ -108,13 +154,28 @@ def tx_gas_results_cache_path(cfg: SimConfig) -> Path:
     )
 
 
-def fetch_tx_gas_results(cfg: SimConfig) -> pd.DataFrame:
-    """Uncached fetch in the *source table* shape.
+def fetch_tx_gas_result_chunks(cfg: SimConfig) -> Iterator[pd.DataFrame]:
+    """Uncached fetch in the *source table* shape, one block-chunk at a time.
 
     The only place this module talks to ClickHouse, so it is also the seam the
-    cache tests spy on and the offline tests replace.
+    cache tests spy on and the offline tests replace. It yields rather than returns
+    so that a caller can retire each chunk before the next is fetched; a range wide
+    enough to matter cannot hold them all at once.
     """
-    return _fetch_clickhouse(cfg, *require_block_range(cfg))
+    first_block, last_block = require_block_range(cfg)
+    client = clickhouse_client(cfg)
+    for lo, hi in block_chunks(first_block, last_block):
+        yield client.query_df(clickhouse_tx_gas_results_sql(cfg, lo, hi))
+
+
+def fetch_tx_gas_results(cfg: SimConfig) -> pd.DataFrame:
+    """The whole uncached fetch as one frame.
+
+    Convenience for callers small enough not to care -- the cached path streams
+    `fetch_tx_gas_result_chunks` instead, and nothing on the simulation path calls
+    this.
+    """
+    return _concat_chunks(list(fetch_tx_gas_result_chunks(cfg)))
 
 
 def prepare_tx_gas_results(raw: pd.DataFrame, cfg: SimConfig) -> pd.DataFrame:
@@ -185,16 +246,21 @@ def clickhouse_client(cfg: SimConfig):
     )
 
 
-def _fetch_clickhouse(cfg: SimConfig, first_block: int, last_block: int) -> pd.DataFrame:
-    client = clickhouse_client(cfg)
-    chunks = [
-        client.query_df(clickhouse_tx_gas_results_sql(cfg, lo, hi))
-        for lo, hi in block_chunks(first_block, last_block)
-    ]
-    frame = _concat_chunks(chunks)
-    if frame.empty:
-        raise ValueError(_empty_result_message(client, cfg, first_block, last_block))
-    return frame
+def _empty_result_report(cfg: SimConfig, first_block: int, last_block: int) -> str:
+    """The empty-result diagnostic, with its own client.
+
+    The streaming fetch has already closed over its client by the time the caller
+    knows every chunk was empty, and listing the datasets the table *does* hold is
+    worth a second connection. Failing to connect must not mask the real error.
+    """
+    try:
+        return _empty_result_message(clickhouse_client(cfg), cfg, first_block, last_block)
+    except Exception as exc:  # noqa: BLE001 - diagnostic only
+        return (
+            f"no rows for analysis_config_hash={cfg.analysis_config_hash!r} "
+            f"schedule_name={cfg.schedule_name!r} in blocks "
+            f"{first_block}-{last_block} (could not list available datasets: {exc})"
+        )
 
 
 def _empty_result_message(client, cfg: SimConfig, first_block: int, last_block: int) -> str:
@@ -484,17 +550,28 @@ def block_gas_used(selected: pd.DataFrame) -> int:
 def tx_gas_results_provenance(
     raw: pd.DataFrame, frame: pd.DataFrame, cfg: SimConfig
 ) -> dict:
-    """What was fetched, from where, under which pinned dataset."""
+    """What was fetched, from where, under which pinned dataset.
+
+    A whole-frame fetch is just the one-chunk case of the streamed one, so it runs
+    through the same accumulate-and-merge path rather than a parallel formula that
+    could drift from it.
+    """
+    return _merge_provenance([_provenance_stats(raw, frame, cfg)], cfg)
+
+
+def _provenance_stats(raw: pd.DataFrame, frame: pd.DataFrame, cfg: SimConfig) -> dict:
+    """Everything one chunk contributes to provenance.
+
+    Taken while the chunk is still in memory: the streamed fetch retires each chunk
+    before the next arrives, so nothing can be recomputed from the raw rows later.
+    """
     blocks = frame["block_number"]
     return {
-        "table": CLICKHOUSE_TABLE,
-        "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "analysis_config_hash": _single(frame, "analysis_config_hash", cfg.analysis_config_hash),
         "schedule_config_hash": _single(frame, "schedule_config_hash", cfg.schedule_config_hash),
-        "schedule_name": cfg.schedule_name,
         "chain_id": _single(frame, "chain_id", cfg.chain_id),
-        "requested_block_range": list(cfg.source_block_range) if cfg.source_block_range else None,
-        "observed_block_range": [int(blocks.min()), int(blocks.max())] if len(blocks) else None,
+        "first_block": int(blocks.min()) if len(blocks) else None,
+        "last_block": int(blocks.max()) if len(blocks) else None,
         "row_count": int(len(frame)),
         "block_count": int(blocks.nunique()),
         "simulatable_row_count": int(
@@ -506,6 +583,72 @@ def tx_gas_results_provenance(
         "producer_git_commit": _distinct(raw, "producer_git_commit"),
         "replay_semantics": _distinct(raw, "replay_semantics"),
     }
+
+
+def _merge_provenance(stats: list[dict], cfg: SimConfig) -> dict:
+    """Combine per-chunk provenance into the record for the whole fetch.
+
+    Counts add rather than needing the rows back because `block_chunks` yields
+    disjoint, contiguous block ranges: no block, and so no block hash, is seen by
+    two chunks.
+    """
+    firsts = [s["first_block"] for s in stats if s["first_block"] is not None]
+    lasts = [s["last_block"] for s in stats if s["last_block"] is not None]
+    return {
+        "table": CLICKHOUSE_TABLE,
+        "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "analysis_config_hash": _first(stats, "analysis_config_hash"),
+        "schedule_config_hash": _first(stats, "schedule_config_hash"),
+        "schedule_name": cfg.schedule_name,
+        "chain_id": _first(stats, "chain_id"),
+        "requested_block_range": list(cfg.source_block_range) if cfg.source_block_range else None,
+        "observed_block_range": [min(firsts), max(lasts)] if firsts else None,
+        "row_count": sum(s["row_count"] for s in stats),
+        "block_count": sum(s["block_count"] for s in stats),
+        "simulatable_row_count": sum(s["simulatable_row_count"] for s in stats),
+        "block_hash_coverage": _merge_coverage(stats, "block_hash_coverage"),
+        "block_timestamp_coverage": _merge_timestamp_coverage(stats),
+        "producer_schema_version": _merge_distinct(stats, "producer_schema_version"),
+        "producer_git_commit": _merge_distinct(stats, "producer_git_commit"),
+        "replay_semantics": _merge_distinct(stats, "replay_semantics"),
+    }
+
+
+def _first(stats: list[dict], key: str):
+    return next((s[key] for s in stats if s[key] is not None), None)
+
+
+def _merge_coverage(stats: list[dict], key: str) -> dict:
+    present = [s[key] for s in stats if s[key].get("present")]
+    if not present:
+        return {"present": False}
+    return {
+        "present": True,
+        "distinct": sum(c["distinct"] for c in present),
+        "null_count": sum(c["null_count"] for c in present),
+    }
+
+
+def _merge_timestamp_coverage(stats: list[dict]) -> dict:
+    merged = _merge_coverage(stats, "block_timestamp_coverage")
+    if not merged["present"]:
+        return merged
+    coverages = [s["block_timestamp_coverage"] for s in stats]
+    bounded = [c for c in coverages if "min" in c]
+    if bounded:
+        # Same-format UTC ISO-8601, so lexical order is chronological order.
+        merged |= {
+            "min": min(c["min"] for c in bounded),
+            "max": max(c["max"] for c in bounded),
+        }
+    return merged
+
+
+def _merge_distinct(stats: list[dict], key: str) -> list | None:
+    present = [s[key] for s in stats if s[key] is not None]
+    if not present:
+        return None
+    return sorted({v for values in present for v in values}, key=str)
 
 
 def _single(frame: pd.DataFrame, column: str, fallback=None):

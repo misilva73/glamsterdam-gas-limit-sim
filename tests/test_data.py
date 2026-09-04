@@ -26,7 +26,13 @@ from schemas import (
     TX_GAS_RESULT_PROVENANCE_FIELDS,
 )
 from tests import dummy
-from tests.conftest import FIRST_BLOCK, LAST_BLOCK, NUM_BLOCKS
+from tests.conftest import (
+    FIRST_BLOCK,
+    LAST_BLOCK,
+    NUM_BLOCKS,
+    offline_tx_gas_result_chunks,
+    offline_tx_gas_results,
+)
 
 
 @pytest.fixture
@@ -246,13 +252,13 @@ def test_cache_round_trip_writes_a_sidecar_and_skips_the_second_fetch(
     offline_cfg, offline_data, monkeypatch
 ):
     calls = []
-    real_fetch = loader.fetch_tx_gas_results
+    real_fetch = loader.fetch_tx_gas_result_chunks
 
     def counting_fetch(cfg):
         calls.append(cfg)
-        return real_fetch(cfg)
+        yield from real_fetch(cfg)
 
-    monkeypatch.setattr(loader, "fetch_tx_gas_results", counting_fetch)
+    monkeypatch.setattr(loader, "fetch_tx_gas_result_chunks", counting_fetch)
 
     first = loader.load_tx_gas_results(offline_cfg)
     path = loader.tx_gas_results_cache_path(offline_cfg)
@@ -300,6 +306,87 @@ def test_a_fetch_without_a_block_range_is_refused(tmp_path):
     cfg = SimConfig(analysis_config_hash="abc", cache_dir=tmp_path)
     with pytest.raises(ValueError, match="source_block_range is required"):
         loader.fetch_tx_gas_results(cfg)
+
+
+# --- Streamed cache writes --------------------------------------------------------
+
+
+def test_the_trace_is_cached_as_ordered_parts_not_one_frame(offline_cfg, offline_data):
+    """The whole point of the streamed write: no chunk is ever held twice."""
+    frame = loader.load_tx_gas_results(offline_cfg)
+    path = loader.tx_gas_results_cache_path(offline_cfg)
+
+    assert path.is_dir()
+    parts = sorted(path.glob(cache.PART_GLOB))
+    assert len(parts) > 1, "the offline chunker must produce a multi-part entry"
+    # Parts partition the trace in ascending block order, so reading them in
+    # lexical order rebuilds exactly the frame the loader returned.
+    assert sum(len(pd.read_parquet(p)) for p in parts) == len(frame)
+    assert frame["block_number"].is_monotonic_increasing
+    assert [int(pd.read_parquet(p)["block_number"].min()) for p in parts] == sorted(
+        int(pd.read_parquet(p)["block_number"].min()) for p in parts
+    )
+
+
+def test_streaming_reproduces_the_whole_frame_exactly(offline_cfg, offline_data):
+    """Chunking is an implementation detail; the frame handed to the simulation
+    must be indistinguishable from preparing the trace in one piece -- same rows,
+    same order, and same dtypes, since Arrow round-trips the nullable ones."""
+    streamed = loader.load_tx_gas_results(offline_cfg)
+    raw = offline_tx_gas_results(offline_cfg)
+    direct = loader.prepare_tx_gas_results(raw, offline_cfg)
+    pd.testing.assert_frame_equal(streamed, direct)
+
+
+def test_streamed_provenance_matches_the_whole_frame_formula(offline_cfg, offline_data):
+    """Merging per-chunk stats must not drift from measuring the frame in one go."""
+    loader.load_tx_gas_results(offline_cfg)
+    streamed = json.loads(
+        cache.sidecar_path(loader.tx_gas_results_cache_path(offline_cfg)).read_text()
+    )
+
+    raw = offline_tx_gas_results(offline_cfg)
+    whole = loader.tx_gas_results_provenance(
+        raw, loader.prepare_tx_gas_results(raw, offline_cfg), offline_cfg
+    )
+
+    # `fetched_at` is a wall clock, so it is the one field that must differ.
+    assert {k: v for k, v in streamed.items() if k != "fetched_at"} == {
+        k: v for k, v in whole.items() if k != "fetched_at"
+    }
+
+
+def test_an_interrupted_fetch_leaves_no_cache_entry(offline_cfg, monkeypatch):
+    """A short entry must not be readable as if it were the whole trace."""
+
+    def failing_chunks(cfg):
+        yield from list(offline_tx_gas_result_chunks(cfg))[:1]
+        raise RuntimeError("connection dropped mid-fetch")
+
+    monkeypatch.setattr(loader, "fetch_tx_gas_result_chunks", failing_chunks)
+    path = loader.tx_gas_results_cache_path(offline_cfg)
+
+    with pytest.raises(RuntimeError, match="connection dropped"):
+        loader.load_tx_gas_results(offline_cfg)
+
+    assert not path.exists()
+    assert not list(path.parent.glob("*.partial")), "staging must not survive a failure"
+
+
+def test_a_shuffled_cache_entry_is_refused(offline_cfg, offline_data):
+    """Cohorts are cut positionally, so an unsorted trace would fail silently."""
+    loader.load_tx_gas_results(offline_cfg)
+    path = loader.tx_gas_results_cache_path(offline_cfg)
+    parts = sorted(path.glob(cache.PART_GLOB))
+
+    # Swap the first and last parts' contents, so lexical order is no longer
+    # block order -- exactly what a bad recombination would look like.
+    first, last = pd.read_parquet(parts[0]), pd.read_parquet(parts[-1])
+    first.to_parquet(parts[-1], index=False)
+    last.to_parquet(parts[0], index=False)
+
+    with pytest.raises(ValueError, match="not in block order"):
+        loader.load_tx_gas_results(offline_cfg)
 
 
 # --- ClickHouse SQL construction --------------------------------------------------
