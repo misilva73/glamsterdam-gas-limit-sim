@@ -38,7 +38,8 @@ sim/engine.py                 the per-block loop: fee update, gas-limit ramp, de
                               draw, block fill, price-signal update
 sim/metrics.py                pure protocol functions + per-step record assembly
 
-run_simulation.py             CLI: load → simulate the grid → write output
+run_simulation.py             CLI: load → simulate the grid, checkpointing each
+                              cell as it finishes → write the manifest
 tests/dummy.py                synthetic replay rows + headers (test fixtures only)
 tests/conftest.py             `offline_data`, which injects them at the fetch seams
 tests/                        pytest suite
@@ -156,6 +157,17 @@ Model in `METHODOLOGY.md` §6.
 
 ## Behavioural decisions worth knowing
 
+- **A checkpoint writes data before the summary row describing it**, and
+  `cell_arrival_modes` fixes how many part files and summary rows every cell
+  produces. Those two facts are what `--resume` reads the disk with: complete
+  cells are the leading run of cells whose parts are all present, bounded by
+  `summary_rows // len(modes)`, and the summary is truncated to that. Reordering
+  the writes, or letting a cell emit a mode the sweep did not declare, silently
+  breaks resume — hence the assert in `checkpoint_cell`.
+- **The manifest is written twice**, before the first cell and at the end, and
+  `completed` tells them apart. `--resume` compares the stored `config`, `grid`,
+  and `resolved` against the current ones and refuses on any difference except
+  the path fields in `RESUME_EXEMPT_CONFIG_FIELDS`.
 - **Both persistent-state updates are parent-derived.** Neither the base fee nor
   the ramp is applied at position 0, so the first recorded block reports the
   configured initial state verbatim and the ramp first applies at position 1.
@@ -240,7 +252,14 @@ at high demand the backlog grows monotonically, so throughput falls with horizon
 A full-week 5x cell is ~8.4 min/path, so 20 bootstrap runs ≈ 2.8 h at ~1.8 GB per
 worker; low-demand cells are essentially free. **Plan the grid accordingly** — cost
 is dominated entirely by the cells whose realized multiplier runs high, and the two
-demand axes multiply (the defaults are 48 cells).
+demand axes multiply (the defaults are 27 cells).
+
+Memory no longer scales with the grid: each cell is written to `per_step/` and
+freed before the next one starts, so the retained source frame and cohorts set the
+floor and one cell's paths sit on top of it. A whole sweep therefore belongs in one
+process — sharding it per cell across invocations is no longer necessary, and each
+shard would pay the ~16 GB source-frame floor again. Peak is briefly two copies of
+one cell, from the concat that assembles its part file.
 
 The mempool is tombstoned parallel numpy arrays with amortised compaction
 (`COMPACTION_DEAD_SHARE`), and the tip sort is tranched (`TIP_TRANCHE_SIZE`),
@@ -252,9 +271,12 @@ implementations, and compaction cadence is asserted not to change output.
 
 1. **Block fill is driven purely by actual gas.** For a conservative-builder model,
    see "No per-transaction gas limit is modelled" above first.
-2. **Per-step output is concatenated in memory.** `run_simulation` builds the whole
-   per-step frame before writing; a full week × 48 cells × 20 runs is ~48M rows,
-   which needs partitioned writes.
+2. **Resume is per cell and prefix-based, not per path.** A cell killed halfway
+   through its 20 paths is simulated again from scratch, which on a full-week
+   high-demand cell is ~2.8 h of rework. `--resume` also trusts that the
+   checkpointed cells are a *prefix* of `grid_cells` — true because cells run
+   sequentially, but it means hand-deleting a part file from the middle silently
+   rewinds the sweep to that point rather than filling the hole.
 3. **Re-derive the bootstrap window `L` on real data.** The dummy trace's
    autocorrelation is set by its own AR(1) parameters, so the current answer is
    circular. `tests/dummy.py` in particular draws dynamic-fee priority fees i.i.d.

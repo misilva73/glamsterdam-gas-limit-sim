@@ -3,8 +3,17 @@
 
 Sweeps the elasticity x demand-level x bootstrap-window grid, runs
 `num_bootstrap_runs` independent moving-block-bootstrap paths plus one matching
-historical reference path per cell, and writes the per-step frame, the scenario
+historical reference path per cell, and writes the per-step data, the scenario
 summaries, and a run manifest.
+
+Output is **checkpointed per grid cell**: when a cell finishes, its paths go to
+`per_step/<cell>_<mode>.parquet` and its summary rows are appended to
+`scenario_summary.csv` before the next cell starts. Nothing but the cell in
+flight is held in memory, so a whole sweep fits in one process and a crash at
+hour nine costs one cell rather than everything. Every invocation writes into a
+fresh timestamped directory under `output_dir`, so runs never mix -- unless
+`--resume STAMP` names an interrupted one, in which case the cells it already
+checkpointed are skipped and the rest are simulated into the same directory.
 
 It does no analysis and draws no figures. The job here is to produce data;
 reading it belongs in `notebooks/`.
@@ -37,11 +46,26 @@ from data.load_tx_gas_results import (
     load_tx_gas_results,
     replay_outcome_summary,
 )
+from schemas import PER_STEP_COLUMNS
 from sim.engine import run_path
 from sim.workload import bootstrap_path, bootstrap_rng, build_cohorts, historical_path
 
 BOOTSTRAP_MODE = "moving_block_bootstrap"
 HISTORICAL_MODE = "historical"
+
+ARRIVAL_MODE_SLUGS = {BOOTSTRAP_MODE: "bootstrap", HISTORICAL_MODE: "historical"}
+"""Short tokens for part-file names; the column itself keeps the full mode name."""
+
+PER_STEP_DIR = "per_step"
+SUMMARY_FILE = "scenario_summary.csv"
+OUTCOMES_FILE = "replay_outcome_summary.csv"
+MANIFEST_FILE = "manifest.json"
+
+RUN_DIR_FORMAT = "%Y%m%dT%H%M%SZ"
+"""UTC stamp naming a run's own output directory, so runs sort chronologically."""
+
+RESUME_EXEMPT_CONFIG_FIELDS = frozenset({"output_dir", "cache_dir", "secrets_path"})
+"""Config fields `--resume` tolerates differing: where files live, not what is simulated."""
 
 SATURATION_THRESHOLD = 0.99
 """Utilization at or above which a block counts as saturated in a dimension."""
@@ -189,7 +213,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the historical reference path (bands only)",
     )
 
-    parser.add_argument("--output-dir", type=Path, help="destination (default: output/)")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="parent of the timestamped run directory (default: output/)",
+    )
+    parser.add_argument(
+        "--resume",
+        metavar="STAMP",
+        help="continue an interrupted run: the name of its directory under "
+        "--output-dir (e.g. 20260904T083556Z). Cells already checkpointed there "
+        "are skipped; the config, grid, seed, and resolved trace must match the "
+        "run being resumed or nothing is written",
+    )
     return parser
 
 
@@ -244,16 +280,30 @@ def build_grid(args: argparse.Namespace, base: SimulationGrid = SimulationGrid()
 
 
 class SimulationResult(NamedTuple):
-    per_step: pd.DataFrame
+    """What a finished run leaves behind.
+
+    The per-step frame is deliberately absent: it is streamed to
+    `run_dir / PER_STEP_DIR` a cell at a time and never assembled in memory. Read
+    the whole sweep back with `pd.read_parquet(result.run_dir / "per_step")`.
+    """
+
+    run_dir: Path
     outcomes: pd.DataFrame
     summary: pd.DataFrame
     manifest: dict
     outputs: list[Path]
 
 
-def run_simulation(cfg: SimConfig, grid: SimulationGrid) -> SimulationResult:
+def run_simulation(
+    cfg: SimConfig, grid: SimulationGrid, *, resume: str | None = None
+) -> SimulationResult:
     timings: dict[str, float] = {}
     started = time.perf_counter()
+    cells = grid_cells(grid)
+    modes = cell_arrival_modes(cfg, grid)
+    # Checked before the load, which is the expensive part: an incompatible
+    # --resume should fail in milliseconds, not after a 500-second fetch.
+    resumed = open_resumed_run(cfg, grid, resume, cells, modes) if resume else None
 
     with _timed(timings, "load_seconds"):
         # Every replay row is demand; the outcome breakdown is a report on what
@@ -267,40 +317,99 @@ def run_simulation(cfg: SimConfig, grid: SimulationGrid) -> SimulationResult:
         base_fee = resolve_starting_base_fee(cfg, headers, simulatable)
 
     horizon = cfg.simulation_horizon_blocks or len(cohorts)
+    resolved = resolved_facts(cfg, horizon, base_fee)
 
-    with _timed(timings, "simulate_seconds"):
-        per_step = pd.concat(
-            [
-                frame
-                for elasticity in grid.aggregate_elasticities
-                for level in grid.demand_levels
-                for window in grid.bootstrap_window_blocks
-                for frame in run_scenario(
-                    cohorts,
-                    cfg.with_(
-                        aggregate_elasticity=elasticity,
-                        demand_level=level,
-                        bootstrap_window_blocks=window,
-                    ),
-                    horizon=horizon,
-                    base_fee=base_fee,
-                    include_historical=grid.include_historical_reference,
-                )
-            ],
-            ignore_index=True,
-        )
+    if resumed is None:
+        run_dir, done, summaries = new_run_dir(cfg.output_dir), 0, []
+    else:
+        # The trace itself has to match too: the same block range can load
+        # different rows as the upstream table grows, and cells simulated against
+        # two different traces do not belong in one output directory.
+        require_resumable_trace(resumed, resolved)
+        run_dir, done, summaries = resumed.run_dir, resumed.cells_done, [resumed.summary]
 
-    summary = scenario_summary(per_step)
+    per_step_dir = run_dir / PER_STEP_DIR
+    per_step_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = run_dir / SUMMARY_FILE
     with _timed(timings, "write_seconds"):
-        outputs = write_outputs(cfg, per_step, outcomes, summary)
-
-    timings["total_seconds"] = time.perf_counter() - started
-    manifest = run_manifest(cfg, grid, horizon, base_fee, timings, outputs)
-    manifest_path = Path(cfg.output_dir) / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
-    return SimulationResult(
-        per_step, outcomes, summary, manifest, outputs + [manifest_path]
+        # The outcome mix describes the loaded trace, so it is already final.
+        write_replay_outcomes(run_dir, outcomes)
+    # Written before the first cell, so an interrupted run can be resumed at all:
+    # `--resume` reads this to check that it is continuing the same simulation.
+    manifest_path = write_manifest(
+        run_dir,
+        run_manifest(
+            cfg, grid, resolved, timings, run_dir_files(run_dir), run_dir, completed=False
+        ),
     )
+
+    for cell in cells[done:]:
+        elasticity, level, window = cell
+        cell_cfg = cfg.with_(
+            aggregate_elasticity=elasticity,
+            demand_level=level,
+            bootstrap_window_blocks=window,
+        )
+        with _timed(timings, "simulate_seconds"):
+            frames = run_scenario(
+                cohorts,
+                cell_cfg,
+                horizon=horizon,
+                base_fee=base_fee,
+                include_historical=grid.include_historical_reference,
+            )
+        with _timed(timings, "write_seconds"):
+            summaries.append(
+                checkpoint_cell(per_step_dir, summary_path, cell_slug(*cell), modes, frames)
+            )
+        # Drop the cell before the next one is simulated: keeping the binding
+        # alive would hold two cells at the peak instead of one.
+        del frames
+
+    summary = pd.concat([f for f in summaries if not f.empty], ignore_index=True)
+    timings["total_seconds"] = time.perf_counter() - started
+    outputs = run_dir_files(run_dir)
+    manifest = run_manifest(
+        cfg, grid, resolved, timings, outputs, run_dir, completed=True
+    )
+    write_manifest(run_dir, manifest)
+    return SimulationResult(run_dir, outcomes, summary, manifest, outputs + [manifest_path])
+
+
+def grid_cells(grid: SimulationGrid) -> list[tuple[float, float, int]]:
+    """Every cell of the sweep, in the order it is simulated and written.
+
+    `--resume` depends on this order being stable: cells are checkpointed
+    sequentially, so what is on disk is always a prefix of this list.
+    """
+    cells = [
+        (elasticity, level, window)
+        for elasticity in grid.aggregate_elasticities
+        for level in grid.demand_levels
+        for window in grid.bootstrap_window_blocks
+    ]
+    if not cells:
+        raise ValueError("empty simulation grid: every axis needs at least one value")
+    return cells
+
+
+def cell_arrival_modes(cfg: SimConfig, grid: SimulationGrid) -> tuple[str, ...]:
+    """The arrival modes every cell writes: one part file and one summary row each.
+
+    Fixed for the whole sweep, which is what lets `--resume` tell a finished cell
+    from an interrupted one by counting files and rows.
+    """
+    if cfg.arrival_mode == HISTORICAL_MODE:
+        return (HISTORICAL_MODE,)
+    modes = (BOOTSTRAP_MODE,) if cfg.num_bootstrap_runs > 0 else ()
+    if grid.include_historical_reference:
+        modes += (HISTORICAL_MODE,)
+    if not modes:
+        raise ValueError(
+            "nothing to simulate: --num-runs 0 leaves only the historical "
+            "reference, which --no-historical then skips"
+        )
+    return modes
 
 
 def run_scenario(
@@ -426,50 +535,264 @@ def scenario_summary(per_step: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
-def write_outputs(
-    cfg: SimConfig,
-    per_step: pd.DataFrame,
-    outcomes: pd.DataFrame,
-    summary: pd.DataFrame,
-) -> list[Path]:
-    out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # Parquet only. A CSV copy of the same frame is ~3.5x the bytes, ~11x slower
-    # to write, and lossy on reload (bools become strings, the Int64/int64
-    # distinction goes), so it cost real wall clock while being the worse copy.
-    # The small summaries below stay CSV because they are meant to be read.
-    paths = [out_dir / "per_step.parquet"]
-    per_step.to_parquet(paths[0], index=False)
+def new_run_dir(output_dir: Path) -> Path:
+    """A fresh timestamped directory under `output_dir`, holding this run's files.
 
-    outcomes_path = out_dir / "replay_outcome_summary.csv"
-    outcomes.to_csv(outcomes_path)
-    summary_path = out_dir / "scenario_summary.csv"
-    summary.to_csv(summary_path, index=False)
-    return paths + [outcomes_path, summary_path]
+    Every invocation gets its own unless it passes `--resume`, so an incremental
+    sweep can never append into another run's part files -- which is what makes a
+    directory of parts safe to read as one dataset.
+    """
+    stamp = time.strftime(RUN_DIR_FORMAT, time.gmtime())
+    for attempt in range(100):
+        run_dir = Path(output_dir) / (stamp if attempt == 0 else f"{stamp}-{attempt}")
+        try:
+            run_dir.mkdir(parents=True)
+        except FileExistsError:
+            continue  # same second as a previous run, or a directory left behind
+        return run_dir
+    raise RuntimeError(f"no unique run directory available under {output_dir}")
+
+
+def checkpoint_cell(
+    per_step_dir: Path,
+    summary_path: Path,
+    slug: str,
+    modes: tuple[str, ...],
+    frames: list[pd.DataFrame],
+) -> pd.DataFrame:
+    """Persist one finished grid cell: its per-step parts, then its summary rows.
+
+    One parquet per (cell x arrival mode) holding every run of that cell, and one
+    appended `scenario_summary.csv` row per part. Data is written before the
+    summary that describes it, so an interrupted sweep never leaves a summary row
+    without the per-step data behind it -- and `--resume` can therefore trust that
+    a summary row means a complete cell.
+
+    Parquet only for the per-step data. A CSV copy of the same frame is ~3.5x the
+    bytes, ~11x slower to write, and lossy on reload (bools become strings, the
+    Int64/int64 distinction goes), so it cost real wall clock while being the
+    worse copy. The small summaries stay CSV because they are meant to be read.
+    """
+    by_mode = _by_arrival_mode(frames)
+    assert tuple(by_mode) == modes, (
+        f"cell wrote {tuple(by_mode)} but the sweep declared {modes}; resume "
+        "counts files and rows per cell, so the two must not drift"
+    )
+
+    summaries = []
+    for mode, frame in by_mode.items():
+        frame.to_parquet(per_step_dir / part_file(slug, mode), index=False)
+        # One mode at a time: `scenario_summary` groups by arrival mode anyway, so
+        # this yields the same rows without concatenating the cell a second time.
+        summaries.append(scenario_summary(frame))
+
+    summary = pd.concat(summaries, ignore_index=True)
+    first_cell = not summary_path.exists()
+    summary.to_csv(
+        summary_path, mode="w" if first_cell else "a", header=first_cell, index=False
+    )
+    return summary
+
+
+def cell_slug(elasticity: float, level: float, window: int) -> str:
+    """Grid identity as a filename stem, e.g. `e0.175_d1.5_w32`.
+
+    `repr` of a float is its shortest round-tripping form, so distinct axis values
+    can never collide into one part file.
+    """
+    return f"e{float(elasticity)!r}_d{float(level)!r}_w{int(window)}"
+
+
+def part_file(slug: str, mode: str) -> str:
+    return f"{slug}_{ARRIVAL_MODE_SLUGS[mode]}.parquet"
+
+
+def write_replay_outcomes(run_dir: Path, outcomes: pd.DataFrame) -> Path:
+    path = run_dir / OUTCOMES_FILE
+    outcomes.to_csv(path)
+    return path
+
+
+def run_dir_files(run_dir: Path) -> list[Path]:
+    """Every data file in a run directory, in a stable order.
+
+    Scanned rather than accumulated so that a resumed run reports the cells its
+    earlier invocations wrote too. `manifest.json` is excluded: it is the file
+    that lists these.
+    """
+    parts = sorted((run_dir / PER_STEP_DIR).glob("*.parquet"))
+    named = [run_dir / OUTCOMES_FILE, run_dir / SUMMARY_FILE]
+    return parts + [path for path in named if path.exists()]
+
+
+# --- Resume -----------------------------------------------------------------
+
+
+class ResumedRun(NamedTuple):
+    run_dir: Path
+    cells_done: int
+    """Leading cells of `grid_cells` already checkpointed; the sweep restarts here."""
+    summary: pd.DataFrame
+    """Their `scenario_summary.csv` rows, kept so the result covers the whole grid."""
+    manifest: dict
+
+
+def open_resumed_run(
+    cfg: SimConfig,
+    grid: SimulationGrid,
+    resume: str,
+    cells: list[tuple[float, float, int]],
+    modes: tuple[str, ...],
+) -> ResumedRun:
+    """Validate `--resume STAMP` and work out where the sweep stopped.
+
+    Refuses anything but a directory holding a matching, unfinished run: resuming
+    into a different config, grid, or seed would leave one output directory
+    describing two simulations, which no reader could untangle.
+    """
+    run_dir = Path(cfg.output_dir) / resume
+    manifest_path = run_dir / MANIFEST_FILE
+    if not run_dir.is_dir():
+        raise ValueError(
+            f"nothing to resume: {run_dir} does not exist. Available runs: "
+            f"{sorted(p.name for p in Path(cfg.output_dir).glob('*') if p.is_dir()) or 'none'}"
+        )
+    if not manifest_path.exists():
+        raise ValueError(
+            f"cannot resume {run_dir}: no {MANIFEST_FILE}, so that run died during "
+            "the load and simulated nothing. Start a fresh run instead"
+        )
+    prior = json.loads(manifest_path.read_text())
+    if prior.get("completed"):
+        raise ValueError(f"cannot resume {run_dir}: that run completed")
+    mismatched = resume_mismatches(prior, cfg, grid)
+    if mismatched:
+        raise ValueError(
+            f"cannot resume {run_dir}: it was run with a different "
+            f"{', '.join(mismatched)}. Resuming would mix two simulations in one "
+            "output directory"
+        )
+
+    cells_done, summary = completed_cells(run_dir, cells, modes)
+    return ResumedRun(run_dir, cells_done, summary, prior)
+
+
+def completed_cells(
+    run_dir: Path, cells: list[tuple[float, float, int]], modes: tuple[str, ...]
+) -> tuple[int, pd.DataFrame]:
+    """How many leading cells are fully checkpointed, and their summary rows.
+
+    Cells are simulated in `grid_cells` order, so what is on disk is a prefix and
+    the count is the first cell whose parts are not all there. A cell is only
+    complete once its summary rows landed as well, so the count is also bounded by
+    the row count; `scenario_summary.csv` is truncated to match, and any cell
+    caught mid-checkpoint is simulated again over its own part files.
+    """
+    per_step_dir = run_dir / PER_STEP_DIR
+    written = 0
+    for cell in cells:
+        slug = cell_slug(*cell)
+        if not all((per_step_dir / part_file(slug, mode)).exists() for mode in modes):
+            break
+        written += 1
+
+    summary_path = run_dir / SUMMARY_FILE
+    rows = pd.read_csv(summary_path) if summary_path.exists() else pd.DataFrame()
+    cells_done = min(written, len(rows) // len(modes))
+    kept = rows.iloc[: cells_done * len(modes)]
+    if len(kept) != len(rows):
+        if kept.empty:
+            # Leave no header behind: the next checkpoint writes the file fresh.
+            summary_path.unlink(missing_ok=True)
+        else:
+            kept.to_csv(summary_path, index=False)
+    return cells_done, kept
+
+
+def resume_mismatches(prior: dict, cfg: SimConfig, grid: SimulationGrid) -> list[str]:
+    """Config and grid fields that differ from the run being resumed.
+
+    Paths are exempt: where the cache and the output tree live says nothing about
+    the numbers, and a resume may well happen on another machine.
+    """
+    stored = prior.get("config", {})
+    current = _jsonable(manifest_config(cfg))
+    mismatched = [
+        name
+        for name, value in current.items()
+        if name not in RESUME_EXEMPT_CONFIG_FIELDS and stored.get(name) != value
+    ]
+    if prior.get("grid") != _jsonable(asdict(grid)):
+        mismatched.append("grid")
+    return mismatched
+
+
+def require_resumable_trace(resumed: ResumedRun, resolved: dict) -> None:
+    """Refuse to resume if the loaded trace or the derived seeds moved.
+
+    The upstream replay table is still being written, so the same block range can
+    load more rows than it did yesterday. That changes the horizon, and every
+    already-written cell was simulated against the shorter one.
+    """
+    stored = resumed.manifest.get("resolved", {})
+    mismatched = [
+        name for name, value in resolved.items() if stored.get(name) != value
+    ]
+    if mismatched:
+        raise ValueError(
+            f"cannot resume {resumed.run_dir}: {', '.join(mismatched)} differs from "
+            "the completed cells, so the trace or the seeds moved under the sweep. "
+            "Start a fresh run instead"
+        )
+
+
+# --- Manifest ---------------------------------------------------------------
+
+
+def resolved_facts(cfg: SimConfig, horizon: int, base_fee: int) -> dict:
+    """What the run resolved from its inputs; also what `--resume` must match."""
+    return {
+        "simulation_horizon_blocks": int(horizon),
+        "starting_base_fee_wei": int(base_fee),
+        "bootstrap_seed": cfg.bootstrap_seed,
+        "demand_seed": cfg.demand_seed,
+    }
+
+
+def manifest_config(cfg: SimConfig) -> dict:
+    return {k: str(v) if isinstance(v, Path) else v for k, v in asdict(cfg).items()}
 
 
 def run_manifest(
     cfg: SimConfig,
     grid: SimulationGrid,
-    horizon: int,
-    base_fee: int,
+    resolved: dict,
     timings: dict[str, float],
     outputs: list[Path],
+    run_dir: Path,
+    *,
+    completed: bool,
 ) -> dict:
     return {
-        "config": {k: str(v) if isinstance(v, Path) else v for k, v in asdict(cfg).items()},
+        # False in the copy written before the first cell: a manifest with
+        # `completed: false` marks a run that was interrupted and can be resumed.
+        # Timings and outputs in that copy cover only what had been written.
+        "completed": completed,
+        "config": manifest_config(cfg),
         "grid": asdict(grid),
-        "resolved": {
-            "simulation_horizon_blocks": horizon,
-            "starting_base_fee_wei": int(base_fee),
-            "bootstrap_seed": cfg.bootstrap_seed,
-            "demand_seed": cfg.demand_seed,
-        },
+        # `config.output_dir` is the parent; `run_dir` is where the run wrote.
+        "resolved": {"run_dir": str(run_dir)} | resolved,
         "library_versions": library_versions(),
         "timings": {k: round(v, 3) for k, v in timings.items()},
-        "outputs": [str(p) for p in outputs],
+        "outputs": [str(p.relative_to(run_dir)) for p in outputs],
         "caveat": CAVEAT,
     }
+
+
+def write_manifest(run_dir: Path, manifest: dict) -> Path:
+    path = run_dir / MANIFEST_FILE
+    path.write_text(json.dumps(manifest, indent=2, default=str))
+    return path
 
 
 def library_versions() -> dict[str, str]:
@@ -482,7 +805,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = build_config(args)
     grid = build_grid(args)
-    result = run_simulation(cfg, grid)
+    result = run_simulation(cfg, grid, resume=args.resume)
 
     print(_banner("REPLAY OUTCOME MIX (every row is simulated; nothing is excluded)"))
     print(
@@ -493,7 +816,7 @@ def main(argv: list[str] | None = None) -> int:
     print(_banner("SCENARIO SUMMARY"))
     print(result.summary.to_string(index=False, float_format=lambda v: f"{v:,.3f}"))
     print(f"\n{CAVEAT}\n")
-    print(f"wrote {len(result.outputs)} files to {cfg.output_dir}")
+    print(f"wrote {len(result.outputs)} files to {result.run_dir}")
     return 0
 
 
@@ -511,12 +834,37 @@ def _tag(per_step: pd.DataFrame, cfg: SimConfig, run_index: int) -> pd.DataFrame
     )
 
 
+def _jsonable(value: dict) -> dict:
+    """Round-trip through JSON so tuples compare equal to the lists on disk."""
+    return json.loads(json.dumps(value, default=str))
+
+
+def _by_arrival_mode(frames: list[pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """A cell's paths concatenated per arrival mode, in the order they ran.
+
+    Reindexing to `PER_STEP_COLUMNS` is what lets the part files be read back as
+    one dataset: pyarrow requires every part to share a schema, and a column order
+    that drifted between cells would break the directory read rather than one file.
+    """
+    grouped: dict[str, list[pd.DataFrame]] = {}
+    for frame in frames:
+        grouped.setdefault(str(frame["arrival_mode"].iloc[0]), []).append(frame)
+    return {
+        mode: pd.concat(group, ignore_index=True)[list(PER_STEP_COLUMNS)]
+        for mode, group in grouped.items()
+    }
+
+
 @contextmanager
 def _timed(timings: dict[str, float], key: str):
-    """Record wall-clock seconds for one simulation phase."""
+    """Accumulate wall-clock seconds for one simulation phase.
+
+    Phases interleave now that each cell is written as it finishes, so a phase is
+    entered once per cell and its total is the sum.
+    """
     started = time.perf_counter()
     yield
-    timings[key] = time.perf_counter() - started
+    timings[key] = timings.get(key, 0.0) + time.perf_counter() - started
 
 
 def _installed_version(name: str) -> str:

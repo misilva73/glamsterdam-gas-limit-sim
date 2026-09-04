@@ -86,7 +86,9 @@ construct a historical or bootstrap arrival path
                   ↓
 simulate demand, mempool, block fill, gas limit, and base fee
                   ↓
-write per-step data, scenario summaries, and manifest
+checkpoint each finished grid cell: per-step parts + summary rows
+                  ↓
+write the manifest
 ```
 
 The upstream replay determines per-transaction gas and success under the candidate
@@ -512,15 +514,50 @@ overshoot.
 
 ## 8. Outputs
 
-All files are written under `output_dir`.
+Each run writes into its own UTC-timestamped directory under `output_dir`
+(`output/20260904T083556Z/`), created at startup. Runs therefore never share a
+directory, which is what makes the incremental writes below safe to read as one
+dataset.
+
+Output is checkpointed **per grid cell**: as soon as a cell's paths finish, they
+are written to `per_step/` and the cell's summary rows are appended to
+`scenario_summary.csv`, before the next cell starts. Nothing but the cell in
+flight is held in memory, so a full sweep runs in a single process, and an
+interrupted run keeps every cell that completed. Data is always written before
+the summary row describing it, so a summary row means a complete cell.
+
+`--resume STAMP` continues an interrupted run in its own directory. Cells are
+simulated in a fixed order, so the checkpointed cells are a prefix of the grid:
+the resumed run counts them, truncates `scenario_summary.csv` to match, and
+simulates the rest. A cell caught mid-checkpoint is simulated again over its own
+part files. Resuming is refused unless the stored config, grid, seed, and resolved
+trace (horizon, starting base fee, derived seeds) all match, since a directory
+mixing two simulations could not be read coherently. A resumed sweep reproduces
+the uninterrupted one exactly: every path's randomness comes from the master seed
+and its run index, not from the order cells were executed in.
 
 ### 8.1 Per-step data
 
-`per_step.parquet` contains one row per simulated block and uses the exact order
-in `schemas.PER_STEP_COLUMNS`. Parquet only: a CSV copy of the same frame is
-~3.5x the bytes, ~11x slower to write, and lossy on reload, so it cost wall clock
-while being the worse copy. The small summaries stay CSV because they are meant
-to be read directly.
+Per-step data is a directory of parquet parts, `per_step/<cell>_<mode>.parquet` —
+one part per grid cell and arrival mode, holding every run of that cell:
+
+```text
+per_step/e0.175_d1.5_w32_bootstrap.parquet     runs 0..num_bootstrap_runs-1
+per_step/e0.175_d1.5_w32_historical.parquet    the matching reference path
+```
+
+The cell stem is `e<aggregate_elasticity>_d<demand_level>_w<bootstrap_window_blocks>`,
+each float rendered as its shortest round-tripping form so distinct axis values
+cannot collide into one part.
+
+Every part contains one row per simulated block, in the exact order in
+`schemas.PER_STEP_COLUMNS`, and carries its own grid identity columns. The shared
+schema and the absence of hive partitioning mean the whole sweep reads back as one
+frame with `pd.read_parquet(run_dir / "per_step")`.
+
+Parquet only: a CSV copy of the same frame is ~3.5x the bytes, ~11x slower to
+write, and lossy on reload, so it cost wall clock while being the worse copy. The
+small summaries stay CSV because they are meant to be read directly.
 
 | Group | Columns |
 | --- | --- |
@@ -537,7 +574,8 @@ Units are wei and gas unless a name states otherwise. `priority_fees_wei` is
 ### 8.2 Scenario summary
 
 `scenario_summary.csv` groups by `arrival_mode`, `aggregate_elasticity`,
-`demand_level`, and `bootstrap_window_blocks`. Its metrics are
+`demand_level`, and `bootstrap_window_blocks` — one row per part file, appended in
+grid order as each cell is checkpointed. Its metrics are
 `execution_saturated_share`, `state_saturated_share`,
 `median_demand_multiplier`, `max_demand_multiplier`,
 `multiplier_clamped_share`, `base_fee_clamped_share`, `runs`, `ended_empty_share`,
@@ -548,7 +586,11 @@ Units are wei and gas unless a name states otherwise. `priority_fees_wei` is
 
 - `replay_outcome_summary.csv`: the whole trace broken down by replay outcome (§4.1). Nothing is excluded; this reports what is being simulated.
 - `manifest.json`: resolved config and grid, seeds, source range, initial base fee,
-  library versions, timings, output paths, and the standing caveat.
+  library versions, timings, the run directory, output paths relative to it, and
+  the standing caveat. Written before the first cell and again at the end;
+  `completed` distinguishes the two, so `completed: false` marks a directory that
+  holds only the cells that finished and is what `--resume` reads. Timings and
+  outputs are those of the last invocation.
 
 A run writes data and nothing else -- no figures, no analysis. Reading the results
 belongs in `notebooks/`, where `analysis.bands.aggregate_bands` collapses the

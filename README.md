@@ -99,25 +99,65 @@ narrow them explicitly on a long trace.
 | `--demand-levels A [A ...]` | Demand-*level* axis: latent-demand multiplier at the anchor price, standing in for never-included and secular-growth demand. | `1 1.5 2` |
 | `--window-blocks L [L ...]` | Bootstrap axis: length in cohorts of each resampled window. | `16 32 64` |
 | `--no-historical` | Skip the historical reference path (bands only). | off |
-| `--output-dir PATH` | Destination for every file below. | `output/` |
+| `--output-dir PATH` | Parent of the timestamped directory this run writes. | `output/` |
+| `--resume STAMP` | Continue an interrupted run: the name of its directory under `--output-dir`. Cells already checkpointed there are skipped and the rest are written into the same directory. Refused unless the config, grid, seed, and resolved trace all match the run being resumed. | off |
 
 ## Output
 
-Written to `--output-dir`. Every column is documented in `METHODOLOGY.md` §8.
+Every run creates its own UTC-timestamped directory under `--output-dir`
+(`output/20260904T083556Z/`), so a new sweep never writes into an older one.
+Every column is documented in `METHODOLOGY.md` §8.
 
-- `per_step.parquet` — one row per simulated block: base fee, gas limit,
+```text
+output/20260904T083556Z/
+├── per_step/
+│   ├── e0.1_d1.0_w16_bootstrap.parquet     every bootstrap run of that cell
+│   ├── e0.1_d1.0_w16_historical.parquet    that cell's reference path
+│   └── ...                                 one pair per grid cell
+├── scenario_summary.csv
+├── replay_outcome_summary.csv
+└── manifest.json
+```
+
+- `per_step/` — one row per simulated block: base fee, gas limit,
   header-equivalent gas used, execution/state gas and utilisation, bottleneck
   dimension, included transactions, sender-facing gas, priority fees, arrivals by
   dimension, eligible / fee-ineligible backlog by count and both gas dimensions,
-  and the demand model's own state.
+  and the demand model's own state. Written **one grid cell at a time, as each
+  cell finishes**: a sweep never holds more than the cell in flight, and an
+  interrupted run keeps every cell that completed. Read the whole sweep back as
+  one frame with `pd.read_parquet("output/<stamp>/per_step")` — every part shares
+  the `schemas.PER_STEP_COLUMNS` schema and carries its own grid identity
+  columns, so no partition decoding is needed.
 - `scenario_summary.csv` — per demand scenario: saturation share by dimension,
   median and max realized multiplier, multiplier and base-fee clamped shares,
   whether anything was left queued at the last arrival, terminal backlog, final
-  base fee.
+  base fee. Rows are appended as each cell is checkpointed, in grid order.
 - `replay_outcome_summary.csv` — the whole trace broken down by how each row fared
   in the replay. Nothing is excluded; this reports what is being simulated, and in
   particular how much state gas sits in gas-rescuable rows.
-- `manifest.json` — resolved config, grid, seeds, library versions, timings.
+- `manifest.json` — resolved config, grid, seeds, library versions, timings, and
+  `completed`. Written twice: once before the first cell, so an interrupted run
+  can be resumed, and again at the end with `completed: true`.
+
+### Resuming an interrupted sweep
+
+A long sweep that dies keeps every cell it checkpointed. Restart it with the
+directory name and it picks up where it stopped:
+
+```bash
+.venv/bin/python run_simulation.py <same flags as before> \
+    --resume 20260904T083556Z
+```
+
+Cells are simulated in a fixed order, so what is on disk is a prefix of the grid;
+`--resume` counts the complete cells and simulates the rest into the same
+directory. A cell caught between its parquet parts and its summary row is
+simulated again rather than trusted. Resuming is refused — before the load, so it
+fails in milliseconds — if the config, grid, or seed differs from the run being
+resumed, or if the trace itself moved (the replay table grows, so the same block
+range can resolve to a longer horizon than the finished cells were run against).
+Either way the answer is a fresh run, not a mixed directory.
 
 ## Read this before quoting any number
 

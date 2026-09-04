@@ -7,7 +7,9 @@ so the CLI, the summaries, and the output contract are testable on their own.
 
 from __future__ import annotations
 
+import itertools
 import json
+import pathlib
 
 import numpy as np
 import pandas as pd
@@ -15,7 +17,7 @@ import pytest
 
 import run_simulation
 import schemas
-from config import DEFAULT_CONFIG
+from config import DEFAULT_CONFIG, SimulationGrid
 from sim.workload import bootstrap_path, bootstrap_rng, build_cohorts
 from tests.dummy import (
     DUMMY_ANALYSIS_CONFIG_HASH,
@@ -25,6 +27,12 @@ from tests.dummy import (
 
 BOOTSTRAP = "moving_block_bootstrap"
 HISTORICAL = "historical"
+
+SCENARIO_KEYS = [
+    "aggregate_elasticity",
+    "demand_level",
+    "bootstrap_window_blocks",
+]
 
 # --- synthetic per-step frames ----------------------------------------------
 
@@ -288,8 +296,9 @@ def test_scenario_summary_reports_one_row_per_scenario():
     assert (summary["multiplier_clamped_share"] == 0.0).all()
 
 
-def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
-    args = parse(
+def end_to_end_args(tmp_path, *overrides: str):
+    """A small two-cell sweep on dummy data, writing under `tmp_path`."""
+    return parse(
         [
             "--block-range",
             "21000000",
@@ -309,26 +318,43 @@ def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
             str(tmp_path / "cache"),
             "--output-dir",
             str(tmp_path / "out"),
+            *overrides,
         ]
     )
-    result = run_simulation.run_simulation(
-        run_simulation.build_config(args), run_simulation.build_grid(args)
+
+
+def run_end_to_end(tmp_path, *overrides: str, resume: str | None = None):
+    args = end_to_end_args(tmp_path, *overrides)
+    return run_simulation.run_simulation(
+        run_simulation.build_config(args),
+        run_simulation.build_grid(args),
+        resume=resume,
     )
 
-    assert set(schemas.PER_STEP_COLUMNS) <= set(result.per_step.columns)
-    assert result.per_step["simulation_position"].max() == 40 - 1
-    assert set(result.per_step["arrival_mode"]) == {BOOTSTRAP, HISTORICAL}
-    assert result.per_step.groupby("arrival_mode")["run_index"].nunique().to_dict() == {
+
+def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
+    result = run_end_to_end(tmp_path)
+
+    # The per-step data is never assembled in memory; the directory of parts is
+    # readable as one dataset, which is the contract downstream depends on.
+    per_step = pd.read_parquet(result.run_dir / "per_step")
+    assert list(per_step.columns) == list(schemas.PER_STEP_COLUMNS)
+    assert per_step["simulation_position"].max() == 40 - 1
+    assert set(per_step["arrival_mode"]) == {BOOTSTRAP, HISTORICAL}
+    assert per_step.groupby("arrival_mode")["run_index"].nunique().to_dict() == {
         BOOTSTRAP: 3,
         HISTORICAL: 1,
     }
     assert len(result.summary) == 4  # arrival modes x elasticities
 
-    # Data only: the per-step frame is parquet, the summaries are small CSVs, and
-    # a run writes no figures and no CSV copy of the per-step frame.
-    written = {path.name for path in result.outputs}
+    # Data only: per-step parts are parquet, the summaries are small CSVs, and a
+    # run writes no figures and no CSV copy of the per-step data.
+    written = {path.relative_to(result.run_dir).as_posix() for path in result.outputs}
     assert written == {
-        "per_step.parquet",
+        "per_step/e0.0_d2.0_w16_bootstrap.parquet",
+        "per_step/e0.0_d2.0_w16_historical.parquet",
+        "per_step/e0.175_d2.0_w16_bootstrap.parquet",
+        "per_step/e0.175_d2.0_w16_historical.parquet",
         "replay_outcome_summary.csv",
         "scenario_summary.csv",
         "manifest.json",
@@ -337,12 +363,195 @@ def test_run_simulation_end_to_end_on_dummy_data(tmp_path, offline_data):
     for path in result.outputs:
         assert path.stat().st_size > 0
 
-    manifest = json.loads((tmp_path / "out" / "manifest.json").read_text())
+    manifest = json.loads((result.run_dir / "manifest.json").read_text())
+    assert manifest["resolved"]["run_dir"] == str(result.run_dir)
     assert manifest["resolved"]["simulation_horizon_blocks"] == 40
     assert manifest["grid"]["aggregate_elasticities"] == [0.0, 0.175]
     assert manifest["grid"]["demand_levels"] == [2.0]
     assert manifest["timings"]["total_seconds"] > 0
+    assert manifest["timings"]["write_seconds"] > 0  # accumulated across cells
     assert "lower bound" in manifest["caveat"].lower()
+
+
+def test_each_cell_is_checkpointed_as_it_finishes(tmp_path, offline_data):
+    """The summary on disk matches the returned one, cell by cell and in order."""
+    result = run_end_to_end(tmp_path)
+
+    on_disk = pd.read_csv(result.run_dir / "scenario_summary.csv")
+    pd.testing.assert_frame_equal(on_disk, result.summary, check_dtype=False)
+    # One row per part file, appended cell by cell: the first cell's rows lead.
+    assert on_disk["aggregate_elasticity"].tolist() == [0.0, 0.0, 0.175, 0.175]
+    assert on_disk["arrival_mode"].tolist() == [BOOTSTRAP, HISTORICAL] * 2
+
+    for part in sorted((result.run_dir / "per_step").glob("*.parquet")):
+        frame = pd.read_parquet(part)
+        # A part holds every run of exactly one cell and one arrival mode.
+        assert frame["arrival_mode"].nunique() == 1
+        assert len(frame.groupby(SCENARIO_KEYS, observed=True)) == 1
+        assert frame["run_index"].nunique() == (
+            3 if frame["arrival_mode"].iloc[0] == BOOTSTRAP else 1
+        )
+
+
+def test_every_run_writes_into_its_own_directory(tmp_path, offline_data):
+    first = run_end_to_end(tmp_path)
+    second = run_end_to_end(tmp_path)
+
+    assert first.run_dir != second.run_dir
+    assert first.run_dir.parent == second.run_dir.parent == tmp_path / "out"
+    # Neither run appended into the other, so each is a complete sweep on its own.
+    for run_dir in (first.run_dir, second.run_dir):
+        assert len(pd.read_csv(run_dir / "scenario_summary.csv")) == 4
+        assert len(list((run_dir / "per_step").glob("*.parquet"))) == 4
+
+
+def test_cell_slug_round_trips_the_axis_values():
+    assert run_simulation.cell_slug(0.175, 1.0, 32) == "e0.175_d1.0_w32"
+    # Neighbouring values must not collide into one part file.
+    assert run_simulation.cell_slug(0.1750001, 1.0, 32) != run_simulation.cell_slug(
+        0.175, 1.0, 32
+    )
+
+
+def test_grid_cells_refuses_an_empty_axis():
+    with pytest.raises(ValueError, match="empty simulation grid"):
+        run_simulation.grid_cells(SimulationGrid(demand_levels=()))
+
+
+def test_cell_arrival_modes_tracks_what_a_cell_actually_writes():
+    cfg, grid = DEFAULT_CONFIG, SimulationGrid()
+    assert run_simulation.cell_arrival_modes(cfg, grid) == (BOOTSTRAP, HISTORICAL)
+    assert run_simulation.cell_arrival_modes(
+        cfg, SimulationGrid(include_historical_reference=False)
+    ) == (BOOTSTRAP,)
+    assert run_simulation.cell_arrival_modes(
+        cfg.with_(arrival_mode=HISTORICAL), grid
+    ) == (HISTORICAL,)
+    with pytest.raises(ValueError, match="nothing to simulate"):
+        run_simulation.cell_arrival_modes(
+            cfg.with_(num_bootstrap_runs=0),
+            SimulationGrid(include_historical_reference=False),
+        )
+
+
+# --- resume -----------------------------------------------------------------
+
+FOUR_CELLS = ("--demand-levels", "1", "2")
+
+
+class Killed(Exception):
+    """Stands in for the OOM or the kill that ends a long sweep."""
+
+
+def kill_after(cells: int):
+    """A `run_scenario` that dies once `cells` cells have been simulated."""
+    real = run_simulation.run_scenario
+    simulated = itertools.count()
+
+    def guard(*args, **kwargs):
+        if next(simulated) >= cells:
+            raise Killed("killed mid-sweep")
+        return real(*args, **kwargs)
+
+    return guard
+
+
+def sole_run_dir(tmp_path) -> pathlib.Path:
+    (run_dir,) = sorted((tmp_path / "out").iterdir())
+    return run_dir
+
+
+def interrupted_run(tmp_path, monkeypatch, *, after: int) -> pathlib.Path:
+    """Run the four-cell sweep and kill it after `after` cells; return its directory."""
+    monkeypatch.setattr(run_simulation, "run_scenario", kill_after(after))
+    with pytest.raises(Killed):
+        run_end_to_end(tmp_path, *FOUR_CELLS)
+    monkeypatch.undo()
+    return sole_run_dir(tmp_path)
+
+
+def test_resuming_an_interrupted_sweep_reproduces_the_uninterrupted_one(
+    tmp_path, offline_data, monkeypatch
+):
+    """The whole point: resume must be indistinguishable from never stopping."""
+    reference = run_end_to_end(tmp_path / "whole", *FOUR_CELLS)
+
+    partial = tmp_path / "killed"
+    run_dir = interrupted_run(partial, monkeypatch, after=2)
+    # Killed mid-sweep: two cells checkpointed, and the manifest says unfinished.
+    assert len(list((run_dir / "per_step").glob("*.parquet"))) == 2 * 2
+    assert json.loads((run_dir / "manifest.json").read_text())["completed"] is False
+
+    result = run_end_to_end(partial, *FOUR_CELLS, resume=run_dir.name)
+
+    assert result.run_dir == run_dir  # same directory, no second timestamp
+    assert result.manifest["completed"] is True
+    assert len(list((partial / "out").iterdir())) == 1
+    pd.testing.assert_frame_equal(
+        result.summary, reference.summary, check_dtype=False
+    )
+    resumed_steps, whole_steps = (
+        pd.read_parquet(directory / "per_step").sort_values(
+            list(schemas.PER_STEP_IDENTITY_COLUMNS), ignore_index=True
+        )
+        for directory in (result.run_dir, reference.run_dir)
+    )
+    pd.testing.assert_frame_equal(resumed_steps, whole_steps)
+
+
+def test_resume_redoes_a_cell_caught_between_its_parts_and_its_summary_row(
+    tmp_path, offline_data, monkeypatch
+):
+    """A crash inside a checkpoint must not leave a summary hole or a duplicate."""
+    run_dir = interrupted_run(tmp_path, monkeypatch, after=3)
+    summary_path = run_dir / "scenario_summary.csv"
+    # Rewind the third cell's rows, leaving its part files behind: exactly the
+    # state a kill between the parquet write and the CSV append would leave.
+    kept = summary_path.read_text().splitlines()[: 1 + 2 * 2]
+    summary_path.write_text("\n".join(kept) + "\n")
+
+    result = run_end_to_end(tmp_path, *FOUR_CELLS, resume=run_dir.name)
+
+    on_disk = pd.read_csv(summary_path)
+    assert len(on_disk) == 4 * 2  # four cells x two arrival modes, no duplicates
+    assert not on_disk.duplicated(SCENARIO_KEYS + ["arrival_mode"]).any()
+    pd.testing.assert_frame_equal(on_disk, result.summary, check_dtype=False)
+
+
+def test_resume_refuses_a_run_it_would_contradict(tmp_path, offline_data, monkeypatch):
+    run_dir = interrupted_run(tmp_path, monkeypatch, after=2)
+
+    with pytest.raises(ValueError, match="different grid"):
+        run_end_to_end(tmp_path, "--demand-levels", "1", "3", resume=run_dir.name)
+    with pytest.raises(ValueError, match="different random_seed"):
+        run_end_to_end(tmp_path, *FOUR_CELLS, "--seed", "1234", resume=run_dir.name)
+    with pytest.raises(ValueError, match="does not exist"):
+        run_end_to_end(tmp_path, *FOUR_CELLS, resume="20200101T000000Z")
+
+    # Nothing was written by any of the refusals.
+    assert len(list((tmp_path / "out").iterdir())) == 1
+    assert len(list((run_dir / "per_step").glob("*.parquet"))) == 2 * 2
+
+
+def test_resume_refuses_a_trace_that_moved_under_the_sweep(
+    tmp_path, offline_data, monkeypatch
+):
+    """Same config, different resolved horizon: the upstream table grew."""
+    run_dir = interrupted_run(tmp_path, monkeypatch, after=2)
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["resolved"]["simulation_horizon_blocks"] = 39
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="simulation_horizon_blocks differs"):
+        run_end_to_end(tmp_path, *FOUR_CELLS, resume=run_dir.name)
+
+
+def test_resume_refuses_a_completed_run(tmp_path, offline_data):
+    result = run_end_to_end(tmp_path)
+
+    with pytest.raises(ValueError, match="completed"):
+        run_end_to_end(tmp_path, resume=result.run_dir.name)
 
 
 def test_run_scenario_honours_historical_only_mode():
