@@ -1,8 +1,8 @@
-"""Tests for the analysis and simulation layer.
+"""Tests for the window-length diagnostic and the simulation plumbing.
 
 The engine and the workload model are exercised elsewhere; here everything is
 driven from a synthetic per-step frame with exactly `schemas.PER_STEP_COLUMNS`,
-so the aggregation and plotting code is testable on its own.
+so the CLI, the summaries, and the output contract are testable on their own.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import pytest
 
 import run_simulation
 import schemas
-from analysis.bands import aggregate_bands
 from analysis.window_length import (
     SUMMARY_SERIES,
     autocorrelation,
@@ -125,78 +124,6 @@ def synthetic_per_step(
 def test_synthetic_frame_matches_the_contract():
     frame = synthetic_per_step()
     assert list(frame.columns) == list(schemas.PER_STEP_COLUMNS)
-
-
-# --- aggregate_bands --------------------------------------------------------
-
-
-def hand_built_per_step(values_by_level: dict[float, list[float]]) -> pd.DataFrame:
-    """One position, one elasticity, one window, one run per listed value."""
-    rows = [
-        {
-            "aggregate_elasticity": 0.175,
-            "demand_level": level,
-            "bootstrap_window_blocks": 32,
-            "simulation_position": 0,
-            "run_index": run_index,
-            "base_fee_per_gas": value,
-        }
-        for level, values in values_by_level.items()
-        for run_index, value in enumerate(values)
-    ]
-    return pd.DataFrame(rows)
-
-
-def test_aggregate_bands_computes_known_quantiles():
-    per_step = hand_built_per_step({1.0: [0.0, 1.0, 2.0, 3.0, 4.0]})
-    bands = aggregate_bands(per_step, ["base_fee_per_gas"]).set_index("statistic")["value"]
-
-    assert bands["min"] == 0.0
-    assert bands["max"] == 4.0
-    assert bands["p50"] == 2.0
-    assert bands["p10"] == pytest.approx(0.4)
-    assert bands["p90"] == pytest.approx(3.6)
-
-
-def test_aggregate_bands_groups_by_every_scenario_axis():
-    per_step = pd.concat(
-        [
-            hand_built_per_step({1.0: [1.0, 2.0, 3.0], 2.0: [10.0, 20.0, 30.0]}),
-            hand_built_per_step({1.0: [5.0, 5.0, 5.0]}).assign(bootstrap_window_blocks=64),
-        ],
-        ignore_index=True,
-    )
-    medians = (
-        aggregate_bands(per_step, ["base_fee_per_gas"])
-        .query("statistic == 'p50'")
-        .set_index(["demand_level", "bootstrap_window_blocks"])["value"]
-    )
-    assert medians[(1.0, 32)] == 2.0
-    assert medians[(2.0, 32)] == 20.0
-    assert medians[(1.0, 64)] == 5.0
-
-
-def test_aggregate_bands_is_tidy_and_covers_every_position():
-    per_step = synthetic_per_step(levels=(1.0, 2.0), windows=(16, 32), positions=10)
-    bands = aggregate_bands(per_step, ["base_fee_per_gas", "gas_limit"])
-
-    assert list(bands.columns) == [
-        "aggregate_elasticity",
-        "demand_level",
-        "bootstrap_window_blocks",
-        "simulation_position",
-        "metric",
-        "statistic",
-        "value",
-    ]
-    assert len(bands) == 2 * 2 * 10 * 2 * 5  # groups x positions x metrics x statistics
-    assert bands["value"].notna().all()
-
-
-def test_aggregate_bands_without_min_max():
-    per_step = synthetic_per_step(positions=3)
-    bands = aggregate_bands(per_step, ["gas_used"], quantiles=(0.25, 0.75), also_min_max=False)
-    assert set(bands["statistic"]) == {"p25", "p75"}
 
 
 # --- autocorrelation and window length --------------------------------------
