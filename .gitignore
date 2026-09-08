@@ -226,3 +226,6 @@ output/
 
 # Local reth/revm source drops
 revm.tar.gz
+
+# macOS
+.DS_Store

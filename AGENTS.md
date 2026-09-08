@@ -260,6 +260,26 @@ cohort arrays. Two facts before reintroducing one:
 
 ## Reporting results
 
+`analysis.ipynb` uses blocks 3,000–7,199 for settled-period medians and
+distributions in the one-day run `20260907T122124Z`, sampling 20,000 individual
+blocks per scenario across all paths. This excludes both the gas-limit ramp and
+the subsequent adjustment. The sample cache is named for the window
+(`steady_3000_7200.parquet`) and retains `simulation_position`; do not reuse the
+older post-ramp `steady.parquet`. The convergence diagnostic compares the two
+halves of the settled window using 24-block averages, with the midpoint rounded
+up to a bin boundary. Recalculate the notebook outputs and figures before
+updating the report's statistics when changing this window.
+
+The notebook caches are scoped to `output/analysis/20260907T122124Z/` and their
+filenames identify the selected windows. Delete that run's analysis-cache directory
+when source results or metric definitions change. Full-run guard, dimension and
+backlog diagnostics read the original parts, not the settled sample. Classify
+near-target scenarios from utilisation (within one percentage point of 50%), not
+from the largest demand multiplier. Report medians as medians: zero median eligible
+backlog does not mean zero maximum, and a ratio of scenario state/execution medians
+does not establish which dimension is larger per block. In this run state is larger
+in about 19–21% of blocks across scenarios.
+
 The assumptions and limitations are `METHODOLOGY.md` §9, with §10 on what each one
 costs a reader. State them whenever results are reported.
 `run_simulation.CAVEAT` is the short form printed by every run and stored in every
